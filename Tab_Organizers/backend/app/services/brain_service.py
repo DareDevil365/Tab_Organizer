@@ -1,11 +1,15 @@
 import logging
+import hashlib
+import asyncio
 import numpy as np
 from typing import List, Dict, Any, Tuple, Optional
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy import select, or_
 
 from app.models.page import Page
+from app.services.content_subjects import semantic_content, clean_content, subject_path, website_name
 from app.models.embedding import PageEmbedding
+from app.models.companion import CompanionNote
 from app.services.embedder import (
     generate_embedding,
     generate_embeddings_batch,
@@ -13,46 +17,44 @@ from app.services.embedder import (
     deserialize_vector,
     compute_cosine_similarity
 )
+from app.services.embedder import embedding_identity
+from app.services.cloud_embeddings import EmbeddingUnavailable
 from app.services.ai_provider import get_ai_provider
 
 logger = logging.getLogger(__name__)
 
 
 async def ensure_page_embeddings(db: AsyncSession) -> int:
-    """Finds all pages that lack vector embeddings and embeds them."""
-    # Find page IDs that already have embeddings
-    emb_stmt = select(PageEmbedding.page_id)
-    emb_res = await db.execute(emb_stmt)
-    embedded_ids = set(emb_res.scalars().all())
+    """Refresh legacy/platform-heavy or changed embeddings from subject content.
 
-    # Find pages not yet embedded
-    stmt = select(Page)
-    res = await db.execute(stmt)
-    all_pages = res.scalars().all()
-
-    unembedded = [p for p in all_pages if p.id not in embedded_ids]
-    if not unembedded:
+    A versioned content fingerprint uses the existing model_name field, avoiding
+    a schema migration and ensuring edited titles/notes metadata get reindexed.
+    """
+    rows = (await db.execute(select(PageEmbedding))).scalars().all()
+    existing = {row.page_id: row for row in rows}
+    pages = (await db.execute(select(Page))).scalars().all()
+    pending = []
+    identity=await asyncio.to_thread(embedding_identity)
+    for page in pages:
+        text = semantic_content(page)
+        fingerprint = hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
+        # v3 also invalidates fallback vectors made with Python's process-seeded
+        # hash function, which could not be compared after a backend restart.
+        version = f"{identity}:subjects-v4:{fingerprint}"
+        row = existing.get(page.id)
+        if row is None or row.model_name != version:
+            pending.append((page, row, text, version))
+    if not pending:
         return 0
-
-    texts_to_embed = [
-        f"Title: {p.title or ''}. Domain: {p.domain or ''}. Topic: {p.topic or ''}. Category: {p.category or ''}. Notes: {p.description or ''}"
-        for p in unembedded
-    ]
-
-    vectors = generate_embeddings_batch(texts_to_embed)
-
-    new_embeddings = [
-        PageEmbedding(
-            page_id=page.id,
-            vector=serialize_vector(vec),
-            model_name="all-MiniLM-L6-v2"
-        )
-        for page, vec in zip(unembedded, vectors)
-    ]
-
-    db.add_all(new_embeddings)
+    vectors = await asyncio.to_thread(generate_embeddings_batch,[item[2] for item in pending])
+    for (page, row, _, version), vector in zip(pending, vectors):
+        if row is None:
+            db.add(PageEmbedding(page_id=page.id, vector=serialize_vector(vector), model_name=version))
+        else:
+            row.vector = serialize_vector(vector)
+            row.model_name = version
     await db.commit()
-    return len(new_embeddings)
+    return len(pending)
 
 
 async def search_relevant_pages(
@@ -62,9 +64,9 @@ async def search_relevant_pages(
     min_similarity: float = 0.1
 ) -> List[Dict[str, Any]]:
     """Performs local semantic similarity search over stored page embeddings."""
-    await ensure_page_embeddings(db)
+    try:await ensure_page_embeddings(db)
+    except EmbeddingUnavailable:return await text_relevant_pages(query,db,top_k)
 
-    # Load all embeddings
     emb_stmt = select(PageEmbedding)
     emb_res = await db.execute(emb_stmt)
     embeddings = emb_res.scalars().all()
@@ -72,17 +74,16 @@ async def search_relevant_pages(
     if not embeddings:
         return []
 
-    # Query embedding
-    query_vec = generate_embedding(query)
+    # Search requests can contain pasted links too. Keep query vectors subject-
+    # based just like document vectors rather than leaking addresses to RAG.
+    try:query_vec = await asyncio.to_thread(generate_embedding,clean_content(query))
+    except EmbeddingUnavailable:return await text_relevant_pages(query,db,top_k)
 
-    # Reconstruct matrix
     doc_vectors = np.array([deserialize_vector(e.vector) for e in embeddings], dtype=np.float32)
     similarities = compute_cosine_similarity(query_vec, doc_vectors)
 
-    # Sort indices
     sorted_indices = np.argsort(-similarities)
 
-    # Fetch corresponding pages
     page_ids = [embeddings[i].page_id for i in sorted_indices[:top_k]]
     page_stmt = select(Page).where(Page.id.in_(page_ids))
     page_res = await db.execute(page_stmt)
@@ -111,6 +112,18 @@ async def search_relevant_pages(
     return results
 
 
+async def text_relevant_pages(query, db, top_k):
+    """Keep Q&A usable on an exhausted free embedding allowance, without mixing vectors."""
+    from app.services.library_search import rank_documents
+    pages=(await db.execute(select(Page))).scalars().all()
+    ranked=await asyncio.to_thread(rank_documents,[{'id':page.id,'title':page.title or '', 'url':page.url_original,'text':semantic_content(page)} for page in pages],query,False)
+    by_id={page.id:page for page in pages}
+    return [{'id':page.id,'title':page.title,'url':page.url_original,'url_normalized':page.url_normalized,
+        'domain':page.domain,'description':page.description,'topic':page.topic,'category':page.category,
+        'similarity_score':item['score']/100,'retrieval_mode':'related-text'} for item in ranked['results'][:top_k]
+        if item['score']>0 for page in [by_id[item['id']]]]
+
+
 async def ask_brain(question: str, db: AsyncSession) -> Dict[str, Any]:
     """
     RAG conversational assistant: retrieves relevant pages from the user's library
@@ -118,15 +131,7 @@ async def ask_brain(question: str, db: AsyncSession) -> Dict[str, Any]:
     """
     relevant_pages = await search_relevant_pages(question, db, top_k=6)
 
-    context_lines = []
-    for idx, p in enumerate(relevant_pages, 1):
-        context_lines.append(
-            f"[{idx}] Title: {p['title']}\n"
-            f"    URL: {p['url']}\n"
-            f"    Domain: {p['domain']}\n"
-            f"    Topic: {p['topic'] or 'general'}\n"
-            f"    Description: {p['description'] or 'No description'}"
-        )
+    context_lines = [f"[{idx}] {semantic_content(p)}" for idx, p in enumerate(relevant_pages, 1)]
     context_str = "\n\n".join(context_lines)
 
     system_prompt = (
@@ -138,7 +143,7 @@ async def ask_brain(question: str, db: AsyncSession) -> Dict[str, Any]:
 
     provider = await get_ai_provider()
     answer_text = await provider.generate_response(
-        prompt=question,
+        prompt=clean_content(question),
         context=context_str if context_str else "No directly matching saved pages found in library.",
         system_prompt=system_prompt
     )
@@ -151,21 +156,80 @@ async def ask_brain(question: str, db: AsyncSession) -> Dict[str, Any]:
     }
 
 
+async def ask_page_brain(
+    page_id: int,
+    message: str,
+    db: AsyncSession
+) -> Dict[str, Any]:
+    """
+    Dedicated in-context AI assistant for a specific tab/page.
+    Automatically context-loads the page metadata, full description, and all user comments/notes.
+    User does NOT need to specify which page they are asking about.
+    """
+    page_stmt = select(Page).where(Page.id == page_id)
+    page_res = await db.execute(page_stmt)
+    page = page_res.scalar_one_or_none()
+
+    if not page:
+        raise ValueError(f"Page with ID {page_id} not found")
+
+    # Fetch all notes/comments linked to this page or URL
+    notes_stmt = select(CompanionNote).where(
+        or_(
+            CompanionNote.page_id == page_id,
+            CompanionNote.video_url == page.url_original
+        )
+    ).order_by(CompanionNote.created_at.asc())
+    notes_res = await db.execute(notes_stmt)
+    notes = notes_res.scalars().all()
+
+    notes_text_list = []
+    for n in notes:
+        time_tag = f"[{n.timestamp_formatted}] " if n.timestamp_seconds > 0 else ""
+        notes_text_list.append(f"- {time_tag}{clean_content(n.comment)}")
+
+    notes_context = "\n".join(notes_text_list) if notes_text_list else "No user comments or notes yet."
+
+    system_prompt = (
+        f"You are the dedicated AI copilot for this specific tab/resource.\n"
+        f"Current Tab Details:\n"
+        f"- Title: {website_name(page)}\n"
+        f"- Subject: {' > '.join(subject_path(page))}\n"
+        f"- Stored Summary / Description: {clean_content(page.description or page.content_summary or 'None')}\n\n"
+        f"User's Notes and Comments on this resource:\n{notes_context}\n\n"
+        f"The user is viewing this tab's detail page right now. You already know what page they are talking about; "
+        f"NEVER ask what page or video they mean. Provide direct, helpful, concise answers, summaries, notes expansions, "
+        f"or technical explanations specifically for this page."
+    )
+
+    provider = await get_ai_provider()
+    answer = await provider.generate_response(
+        prompt=clean_content(message),
+        context=semantic_content(page),
+        system_prompt=system_prompt
+    )
+
+    return {
+        "page_id": page.id,
+        "title": page.title,
+        "message": message,
+        "answer": answer
+    }
+
+
 async def generate_learning_plan(topic: str, db: AsyncSession) -> Dict[str, Any]:
     """Generates a structured learning roadmap from the user's saved pages on a given topic."""
     relevant_pages = await search_relevant_pages(f"learning study guide {topic}", db, top_k=10)
 
-    context_lines = []
-    for idx, p in enumerate(relevant_pages, 1):
-        context_lines.append(f"[{idx}] {p['title']} ({p['url']}) - {p['topic']}: {p['description']}")
+    context_lines = [f"[{idx}] {semantic_content(p)}" for idx, p in enumerate(relevant_pages, 1)]
     context_str = "\n".join(context_lines)
 
     prompt = (
-        f"Create a structured, step-by-step learning syllabus/plan for: '{topic}'.\n"
+        f"Create a structured, step-by-step learning syllabus/plan for: '{clean_content(topic)}'.\n"
         f"Incorporate the user's actual saved pages as required reading/resources for each step:\n\n"
         f"User's saved resources:\n{context_str}\n\n"
         f"Organize into: 1) Prerequisites / Fundamentals, 2) Core Concepts, 3) Advanced / Practice. "
-        f"Explicitly mention their saved links where relevant."
+        f"Refer to saved resources using source numbers [1], [2]; do not invent links."
     )
 
     provider = await get_ai_provider()

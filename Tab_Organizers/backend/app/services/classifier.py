@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func, or_
 
 from app.models.page import Page
+from app.services.state_store import read_json, write_json
 from app.services.ai_provider import (
     get_ai_provider,
     AIProvider,
@@ -192,18 +193,10 @@ DEFAULT_TAXONOMY_RULES = [
 
 def load_taxonomy_rules() -> List[Dict[str, Any]]:
     """Loads rich taxonomy rules from disk, merging with defaults to guarantee all categories exist."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     rules_file = _get_rules_file()
     
-    disk_rules = []
-    if rules_file.exists():
-        try:
-            with open(rules_file, "r", encoding="utf-8") as f:
-                content = json.load(f)
-                if isinstance(content, list):
-                    disk_rules = content
-        except Exception as e:
-            logger.warning(f"Failed to read taxonomy_rules.json: {e}")
+    content=read_json(rules_file,[])
+    disk_rules=content if isinstance(content,list) else []
 
     # Build map of existing rules on disk by lowercased name and slug
     disk_map = {}
@@ -256,16 +249,13 @@ def load_taxonomy_rules() -> List[Dict[str, Any]]:
 
 def save_taxonomy_rules(rules: List[Dict[str, Any]]) -> None:
     """Saves customized taxonomy rules to disk and syncs legacy list."""
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
     rules_file = _get_rules_file()
-    with open(rules_file, "w", encoding="utf-8") as f:
-        json.dump(rules, f, indent=2)
+    write_json(rules_file,rules)
 
     # Sync legacy names list
     names = [r.get("name") or r.get("slug") for r in rules if r]
     legacy_file = _get_taxonomy_file()
-    with open(legacy_file, "w", encoding="utf-8") as f:
-        json.dump(names, f, indent=2)
+    write_json(legacy_file,names)
 
 
 def reset_taxonomy_rules_to_default() -> List[Dict[str, Any]]:

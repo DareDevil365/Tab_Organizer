@@ -1,0 +1,31 @@
+/* Graphite, ivory, champagne and mineral greens. Shared by both extension UIs. */
+:root {
+  --ink-base: #0b0d0c;
+  --ink-surface: #141815;
+  --ink-raised: #1c221e;
+  --ink-border: #303a32;
+  --ink-text: #f1eee5;
+  --ink-muted: #a5ada4;
+  --ink-subtle: #7e8b80;
+  --ink-accent: #d6b77e;
+  --ink-accent-hover: #e6ca97;
+  --ink-accent-soft: #d6b77e13;
+  --ink-jade: #8dc2aa;
+  --ink-blue: #92b9ce;
+  --ink-danger: #df9b94;
+}
+:root[data-theme="light"] {
+  --ink-base: #f5f5ef;
+  --ink-surface: #ffffff;
+  --ink-raised: #e7ede6;
+  --ink-border: #cbd4ca;
+  --ink-text: #17251c;
+  --ink-muted: #526455;
+  --ink-subtle: #657368;
+  --ink-accent: #80602c;
+  --ink-accent-hover: #65481e;
+  --ink-accent-soft: #80602c13;
+  --ink-jade: #287556;
+  --ink-blue: #346b87;
+  --ink-danger: #a84036;
+}

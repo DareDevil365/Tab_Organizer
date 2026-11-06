@@ -1,6 +1,7 @@
 import datetime
 from collections import defaultdict
-from typing import List, Optional
+from typing import List, Optional, Annotated
+from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
@@ -16,8 +17,25 @@ from app.schemas.activity import (
     DailyTrend
 )
 from app.services.url_normalizer import normalize_url
+from app.services.completion import completion_kind
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
+
+
+@router.get('/completions')
+async def completion_summary(days: int = Query(default=7, ge=1, le=90), db: AsyncSession = Depends(get_db)):
+    now = datetime.datetime.now(datetime.timezone.utc)
+    start = now - datetime.timedelta(days=days)
+    pages = (await db.execute(select(Page).where(Page.completed_at >= start, Page.completed_at <= now).order_by(Page.completed_at.desc()))).scalars().all()
+    watched = sum(completion_kind(page) == 'watched' for page in pages)
+    total_saved = (await db.execute(select(func.count(Page.id)))).scalar_one()
+    total_completed = (await db.execute(select(func.count(Page.id)).where(Page.completed_at.is_not(None)))).scalar_one()
+    return {
+        'period_days': days, 'completed': len(pages), 'watched': watched, 'read': len(pages) - watched,
+        'total_saved': total_saved, 'total_completed': total_completed, 'unseen': total_saved - total_completed,
+        'recent': [{'id': page.id, 'title': page.title or 'Saved resource', 'kind': completion_kind(page),
+                    'completed_at': page.completed_at.replace(tzinfo=datetime.timezone.utc).isoformat()} for page in pages[:50]],
+    }
 
 
 @router.post("", status_code=status.HTTP_201_CREATED)
@@ -35,10 +53,23 @@ async def record_activities(payload: ActivityBatchCreate, db: AsyncSession = Dep
         for pid, pnorm, ptopic in res.all():
             page_map[pnorm] = (pid, ptopic)
 
+    # A network response can be lost after commit. Retrying the durable worker
+    # queue must not count that exact same interval a second time.
+    def utc_naive(value):
+        return value.replace(tzinfo=None) if value.tzinfo is None else value.astimezone(datetime.timezone.utc).replace(tzinfo=None)
+
+    starts = [utc_naive(item.started_at) for item in payload.activities]
+    existing = (await db.execute(select(ActivityLog).where(
+        ActivityLog.started_at >= min(starts), ActivityLog.started_at <= max(starts),
+    ))).scalars().all()
+    seen = {(item.url, utc_naive(item.started_at), utc_naive(item.ended_at), item.duration_seconds) for item in existing}
     records = []
     for item in payload.activities:
-        if item.duration_seconds <= 0:
+        start, end = utc_naive(item.started_at), utc_naive(item.ended_at)
+        key = (item.url, start, end, item.duration_seconds)
+        if item.duration_seconds <= 0 or end <= start or key in seen:
             continue
+        seen.add(key)
 
         norm = normalize_url(item.url)
         page_info = page_map.get(norm)
@@ -51,8 +82,8 @@ async def record_activities(payload: ActivityBatchCreate, db: AsyncSession = Dep
                 url=item.url,
                 domain=item.domain or "unknown",
                 topic=topic,
-                started_at=item.started_at,
-                ended_at=item.ended_at,
+                started_at=start,
+                ended_at=end,
                 duration_seconds=item.duration_seconds,
             )
         )
@@ -62,79 +93,81 @@ async def record_activities(payload: ActivityBatchCreate, db: AsyncSession = Dep
     return {"recorded": len(records)}
 
 
+def summarize_activity(logs, days: int, now: datetime.datetime, utc_offset_minutes: int = 0) -> ActivitySummary:
+    """Clip rolling-window intervals and split time across the browser's local dates.
+
+    Offset uses ISO convention: +330 means UTC+05:30 (the browser sends
+    -new Date().getTimezoneOffset()). Legacy naive timestamps are treated as UTC.
+    """
+    utc = datetime.timezone.utc
+    now = now.replace(tzinfo=utc) if now.tzinfo is None else now.astimezone(utc)
+    cutoff = now - datetime.timedelta(days=days)
+    zone = datetime.timezone(datetime.timedelta(minutes=utc_offset_minutes))
+    domain_totals, topic_totals, daily_totals = defaultdict(int), defaultdict(int), defaultdict(int)
+    website_topics = defaultdict(lambda: defaultdict(int))
+    total_seconds = 0
+    for log in logs:
+        start = log.started_at.replace(tzinfo=utc) if log.started_at.tzinfo is None else log.started_at.astimezone(utc)
+        end = log.ended_at.replace(tzinfo=utc) if log.ended_at.tzinfo is None else log.ended_at.astimezone(utc)
+        span = (end - start).total_seconds()
+        left, right = max(start, cutoff), min(end, now)
+        if span <= 0 or right <= left or log.duration_seconds <= 0:
+            continue
+        recorded = min(log.duration_seconds, span)
+        seconds = round(recorded * (right - left).total_seconds() / span)
+        if seconds <= 0:
+            continue
+        try:
+            domain = urlparse(log.url).hostname or log.domain or 'unknown'
+        except ValueError:
+            domain = log.domain or 'unknown'
+        domain = domain.lower().removeprefix('www.')
+        topic = log.topic or 'other'
+        domain_totals[domain] += seconds
+        topic_totals[topic] += seconds
+        website_topics[domain][topic] += seconds
+        total_seconds += seconds
+        # Allocate integer seconds cumulatively so daily bars sum to the total.
+        cursor, allocated = left, 0
+        while cursor < right:
+            local = cursor.astimezone(zone)
+            midnight = datetime.datetime.combine(local.date() + datetime.timedelta(days=1), datetime.time(), tzinfo=zone).astimezone(utc)
+            segment_end = min(midnight, right)
+            cumulative = round(seconds * (segment_end - left).total_seconds() / (right - left).total_seconds())
+            daily_totals[local.date().isoformat()] += cumulative - allocated
+            allocated = cumulative
+            cursor = segment_end
+    sorted_domains = sorted(domain_totals.items(), key=lambda item: item[1], reverse=True)
+    sorted_topics = sorted(topic_totals.items(), key=lambda item: item[1], reverse=True)
+    domain_breakdown = [DomainUsage(domain=domain, duration_seconds=seconds,
+        percentage=round(seconds / total_seconds * 100, 1) if total_seconds else 0,
+        topic=max(website_topics[domain], key=website_topics[domain].get)) for domain, seconds in sorted_domains]
+    topic_breakdown = [TopicUsage(topic=topic, duration_seconds=seconds,
+        percentage=round(seconds / total_seconds * 100, 1) if total_seconds else 0) for topic, seconds in sorted_topics[:10]]
+    first, last = cutoff.astimezone(zone).date(), now.astimezone(zone).date()
+    trends = []
+    while first <= last:
+        key = first.isoformat()
+        trends.append(DailyTrend(date=key, duration_seconds=daily_totals.get(key, 0)))
+        first += datetime.timedelta(days=1)
+    return ActivitySummary(total_seconds=total_seconds, daily_average_seconds=total_seconds // max(1, days),
+        top_domain=sorted_domains[0][0] if sorted_domains else None,
+        top_topic=sorted_topics[0][0] if sorted_topics else None,
+        domain_breakdown=domain_breakdown, topic_breakdown=topic_breakdown, trends=trends)
+
+
 @router.get("/summary", response_model=ActivitySummary)
 async def get_activity_summary(
     days: int = Query(default=7, ge=1, le=90),
-    db: AsyncSession = Depends(get_db)
+    db: AsyncSession = Depends(get_db),
+    utc_offset_minutes: Annotated[int, Query(ge=-840, le=840)] = 0,
 ):
-    """Computes time tracking analytics across domains, topics, and daily trends."""
-    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=days)
-
-    stmt = select(ActivityLog).where(ActivityLog.started_at >= cutoff)
-    res = await db.execute(stmt)
-    logs = res.scalars().all()
-
-    total_seconds = sum(l.duration_seconds for l in logs)
-    daily_avg = total_seconds // max(1, days)
-
-    # Domain aggregations
-    domain_totals = defaultdict(int)
-    topic_totals = defaultdict(int)
-    daily_totals = defaultdict(int)
-
-    for l in logs:
-        domain_totals[l.domain] += l.duration_seconds
-        topic_totals[l.topic or "other"] += l.duration_seconds
-        # Date key YYYY-MM-DD
-        date_str = l.started_at.strftime("%Y-%m-%d")
-        daily_totals[date_str] += l.duration_seconds
-
-    # Sort domains
-    sorted_domains = sorted(domain_totals.items(), key=lambda x: x[1], reverse=True)
-    domain_breakdown = [
-        DomainUsage(
-            domain=d,
-            duration_seconds=sec,
-            percentage=round((sec / total_seconds * 100) if total_seconds > 0 else 0.0, 1)
-        )
-        for d, sec in sorted_domains[:10]
-    ]
-
-    # Sort topics
-    sorted_topics = sorted(topic_totals.items(), key=lambda x: x[1], reverse=True)
-    topic_breakdown = [
-        TopicUsage(
-            topic=t,
-            duration_seconds=sec,
-            percentage=round((sec / total_seconds * 100) if total_seconds > 0 else 0.0, 1)
-        )
-        for t, sec in sorted_topics[:10]
-    ]
-
-    # Fill daily trends for last N days
-    trends = []
+    """Active browsing totals for a rolling period, with browser-local daily bars."""
     now = datetime.datetime.now(datetime.timezone.utc)
-    for i in range(days - 1, -1, -1):
-        day_date = (now - datetime.timedelta(days=i)).strftime("%Y-%m-%d")
-        trends.append(
-            DailyTrend(
-                date=day_date,
-                duration_seconds=daily_totals.get(day_date, 0)
-            )
-        )
-
-    top_domain = sorted_domains[0][0] if sorted_domains else None
-    top_topic = sorted_topics[0][0] if sorted_topics else None
-
-    return ActivitySummary(
-        total_seconds=total_seconds,
-        daily_average_seconds=daily_avg,
-        top_domain=top_domain,
-        top_topic=top_topic,
-        domain_breakdown=domain_breakdown,
-        topic_breakdown=topic_breakdown,
-        trends=trends,
-    )
+    cutoff = now - datetime.timedelta(days=days)
+    stmt = select(ActivityLog).where(ActivityLog.ended_at > cutoff, ActivityLog.started_at < now)
+    logs = (await db.execute(stmt)).scalars().all()
+    return summarize_activity(logs, days, now, utc_offset_minutes)
 
 
 @router.get("/by-domain", response_model=List[DomainUsage])

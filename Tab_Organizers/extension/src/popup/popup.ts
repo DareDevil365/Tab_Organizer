@@ -1,6 +1,14 @@
+import { cacheForBackend,onDeviceSync,pendingSaves,saveOnDevice,savePagesOnDevice as queuePageSaves,removeSavedUrl,startSaveSync,flushSaves } from '../lib/outbox';
+import { deviceGet,deviceSet } from '../lib/device-store';
+import { getBackendConnection } from '../lib/backend-connection';
+import { notePayload,parseNote } from '../lib/note-data';
 import { apiClient } from '../lib/api-client';
+import { CompanionNote, NoteAttachment } from '../types';
 import { storage } from '../lib/storage';
 import { normalizeUrl } from '../lib/url-normalize';
+import { notesForOpenTabs } from '../lib/session-notes';
+import { createSiteIcon } from '../lib/site-icon';
+import { preparePopupHost, closePopup, copyPopupText } from '../lib/popup-host';
 import { extractPageMetadata, ScrapedPageMetadata } from '../content/metadata-scraper';
 import {
   getNextContrastingGroupColor,
@@ -77,18 +85,24 @@ interface ExtendedTab extends chrome.tabs.Tab {
   isTarget?: boolean;
   isNewTab?: boolean;
   isSavedInLibrary?: boolean;
+  pendingSave?:boolean;
+  savedTopic?: string;
 }
 
 document.addEventListener('DOMContentLoaded', async () => {
-  const statusDot = document.getElementById('status-dot') as HTMLDivElement;
-  const backendDot = document.getElementById('backend-dot') as HTMLSpanElement;
-  const statusText = document.getElementById('backend-status-text') as HTMLSpanElement;
+  if (!await preparePopupHost()) return;
   const container = document.getElementById('tab-groups-container') as HTMLDivElement;
   const loading = document.getElementById('loading') as HTMLDivElement;
+  const tabSearchInput = document.getElementById('popup-tab-search') as HTMLInputElement;
+  const statusFilters = document.getElementById('popup-status-filters') as HTMLDivElement;
+  const windowPicker = document.getElementById('popup-window-select') as HTMLSelectElement;
+  const popupTotal = document.getElementById('popup-total-count') as HTMLSpanElement;
+  const cleanupReview = document.getElementById('btn-cleanup-review') as HTMLButtonElement;
+  const btnSaveSelected = document.getElementById('btn-save-selected') as HTMLButtonElement;
   const btnExport = document.getElementById('btn-export') as HTMLButtonElement | null;
   const btnDeleteTabs = document.getElementById('btn-delete-tabs') as HTMLButtonElement;
   const deleteTabsText = document.getElementById('delete-tabs-btn-text') as HTMLSpanElement;
-  const btnOpenDashboard = document.getElementById('btn-open-dashboard') as HTMLDivElement;
+  const btnOpenDashboard = document.getElementById('btn-open-dashboard') as HTMLButtonElement;
   const btnSelectAll = document.getElementById('btn-select-all') as HTMLSpanElement;
   const btnDeselectAll = document.getElementById('btn-deselect-all') as HTMLSpanElement;
   const selectedCountSpan = document.getElementById('selected-count') as HTMLSpanElement;
@@ -144,7 +158,6 @@ document.addEventListener('DOMContentLoaded', async () => {
   const groupNameInput = document.getElementById('group-name-input') as HTMLInputElement;
   const groupColorPicker = document.getElementById('group-color-picker') as HTMLDivElement;
   const groupSaveCloseRow = document.getElementById('group-save-close-row') as HTMLDivElement;
-  const groupCloseTabsCheckbox = document.getElementById('group-close-tabs-checkbox') as HTMLInputElement;
   const btnGroupModalCancel = document.getElementById('btn-group-modal-cancel') as HTMLButtonElement;
   const btnGroupModalConfirm = document.getElementById('btn-group-modal-confirm') as HTMLButtonElement;
 
@@ -178,6 +191,8 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   let allOpenTabs: ExtendedTab[] = [];
+  let companionReady = false;
+  let notesLoad: Promise<void> | null = null;
   let allGroups: chrome.tabGroups.TabGroup[] = [];
   let allSavedGroups: any[] = [];
   const selectedTabIds = new Set<number>();
@@ -186,20 +201,81 @@ document.addEventListener('DOMContentLoaded', async () => {
   let currentMode: 'library' | 'group' = 'library';
   let currentGroupSubtab: 'saved' | 'unsaved' = 'saved';
   let savedLibraryUrlSet = new Set<string>();
+  let savedStatusKnown=false,statusRefreshing=false;
+  const pendingUrls=new Set<string>();
+  const syncLine=document.createElement('div');syncLine.className='popup-sync-status';syncLine.setAttribute('role','status');
+  document.getElementById('popup-search-wrap')!.after(syncLine);
+  async function refreshSavedStatus(){
+    if(statusRefreshing)return;statusRefreshing=true;
+    let rows=await cacheForBackend<any[]>('saved-status')||[];
+    if(rows.length)savedStatusKnown=true;
+    const apply=async()=>{
+      const jobs=await pendingSaves();pendingUrls.clear();
+      savedLibraryUrlSet=new Set(rows.map(row=>normalizeUrl(row.url_normalized||row.url_original)));
+      for(const job of jobs){
+        if(job.kind==='page'||job.kind==='note'){const url=normalizeUrl(job.payload.url_original||job.payload.video_url);savedLibraryUrlSet.add(url);pendingUrls.add(url);}
+        if(job.kind==='remove-page')savedLibraryUrlSet.delete(normalizeUrl(job.payload.url));
+      }
+      for(const tab of allOpenTabs){tab.isSavedInLibrary=savedLibraryUrlSet.has(tab.normalizedUrl);tab.pendingSave=pendingUrls.has(tab.normalizedUrl);tab.savedTopic=rows.find(row=>normalizeUrl(row.url_normalized||row.url_original)===tab.normalizedUrl)?.display_topic;}
+      syncLine.replaceChildren();
+      if(jobs.length){const text=document.createElement('span');text.textContent=`${jobs.length} pending · Saved on device`;const retry=document.createElement('button');retry.textContent='Retry';retry.onclick=()=>void flushSaves(true);syncLine.append(text,retry);}
+      else {
+        const recent=await cacheForBackend<{id:string;at:number}>('recent-removal');
+        if(recent&&Date.now()-recent.at<600000){
+          const text=document.createElement('span');text.textContent='Moved to the five-day recycle bin';
+          const undo=document.createElement('button');undo.textContent='Undo';
+          undo.onclick=async()=>{undo.disabled=true;try{await apiClient.post(`/api/recycle-bin/${recent.id}/restore`,{});await cacheForBackend('recent-removal',null);void refreshSavedStatus();void loadCompanionNotes();}catch{showToast('Could not restore yet. Retry when connected.','error');undo.disabled=false;}};
+          syncLine.append(text,undo);
+        }else if(!savedStatusKnown)syncLine.textContent='Checking saved status · Browsing is available';
+      }
+      renderTabs();updateSelectionUI();
+    };
+    await apply();
+    try{rows=await apiClient.get<any[]>('/api/pages/saved-status');savedStatusKnown=true;await cacheForBackend('saved-status',rows);await apply();}
+    catch{if(!savedStatusKnown&&!pendingUrls.size)syncLine.textContent='Saved status unavailable · Changes are kept on this device';}
+    finally{statusRefreshing=false;}
+  }
+  let tabSearchQuery = '';
+  let saveStatus: 'all' | 'saved' | 'unsaved' = 'all';
+  let revealActiveTabOnOpen = true;
+  let openingRevealRunning=false;
+  let selectionMode = false;
+  const capturedMetadata=new Map<string,ScrapedPageMetadata>();
+  const savePagesOnDevice=(tabs:any[])=>queuePageSaves(tabs.map(tab=>({...capturedMetadata.get(normalizeUrl(tab.url_original)),...tab,
+    description:tab.description||capturedMetadata.get(normalizeUrl(tab.url_original))?.description})));
 
-  // Marvel Multiverse Earth designations
-  const MARVEL_EARTH_NAMES = [
-    'Earth-616',    // Marvel Prime
-    'Earth-101',    // Explicitly requested
-    'Earth-601',    // Explicitly requested
-    'Earth-838',    // Illuminati Earth
-    'Earth-199999', // MCU Main
-    'Earth-928',    // Spider-Man 2099
-    'Earth-1610',   // Ultimate Marvel
-    'Earth-65',     // Spider-Gwen
-    'Earth-1218',   // Real World
-  ];
-  let selectedWindowId: number | null = null;
+  async function readableTabTitle(tab: chrome.tabs.Tab): Promise<string> {
+    const title=(tab.title || '').trim();
+    if (!['','home','sign in','login','youtube','youtube - youtube','untitled','untitled video'].includes(title.toLowerCase()) || tab.id === undefined) return title;
+    try {
+      const result=await chrome.scripting.executeScript({target:{tabId:tab.id},func:extractPageMetadata});
+      const metadata=result[0]?.result;
+      if (metadata?.title && normalizeUrl(metadata.url_original) === normalizeUrl(tab.url || '')) {capturedMetadata.set(normalizeUrl(tab.url||''),metadata);return metadata.title;}
+    } catch { /* Public video metadata recovery in the backend remains available. */ }
+    return title;
+  }
+
+  tabSearchInput?.addEventListener('input', () => {
+    tabSearchQuery = tabSearchInput.value.trim().toLowerCase();
+    renderTabs(); updateSelectionUI();
+  });
+  statusFilters?.querySelectorAll<HTMLButtonElement>('[data-save-status]').forEach(button => {
+    button.addEventListener('click', () => {
+      saveStatus = button.dataset.saveStatus as typeof saveStatus;
+      renderTabs(); updateSelectionUI();
+      document.getElementById('main-content')!.scrollTop = 0;
+    });
+  });
+  windowPicker?.addEventListener('change', () => {
+    const targetId = Number(windowPicker.value);
+    if (targetId) switchAndSwapWindow(targetId);
+  });
+  cleanupReview?.addEventListener('click', () => {
+    dupBanner.style.display = dupBanner.style.display === 'none' ? 'flex' : 'none';
+  });
+
+  const sourceWindow=Number(new URLSearchParams(location.search).get('sourceWindow'));
+  let selectedWindowId: number | null = Number.isInteger(sourceWindow) && sourceWindow>0 ? sourceWindow : null;
   let normalWindows: chrome.windows.Window[] = [];
 
   // Immediately purge any stale custom_unsaved_groups so phantom groups never appear
@@ -208,20 +284,13 @@ document.addEventListener('DOMContentLoaded', async () => {
     chrome.storage.local.remove(['custom_unsaved_groups']);
   }
 
-  function isUrlSavedInLibrary(url: string): boolean {
-    if (!url) return false;
-    const norm = normalizeUrl(url);
-    return savedLibraryUrlSet.has(norm);
-  }
-
   // 1. Health check
   try {
     const health = await apiClient.healthCheck();
     if (health.status === 'ok') {
-      statusDot.className = 'status-dot';
-      statusDot.title = `Backend connected (v${health.version})`;
-      backendDot.className = 'backend-dot';
-      statusText.textContent = `Backend: Connected`;
+      btnOpenDashboard.className = 'brand-mark connected';
+      btnOpenDashboard.title = `Open workspace · Backend online (v${health.version})`;
+      btnOpenDashboard.setAttribute('aria-label', 'Open workspace · Backend online');
       await storage.setBackendStatus('connected');
     } else {
       setBackendOffline();
@@ -231,10 +300,9 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function setBackendOffline() {
-    statusDot.className = 'status-dot disconnected';
-    statusDot.title = 'Backend offline (127.0.0.1:8742)';
-    backendDot.className = 'backend-dot disconnected';
-    statusText.textContent = 'Backend: Offline';
+    btnOpenDashboard.className = 'brand-mark disconnected';
+    btnOpenDashboard.title = 'Open workspace · Check the backend connection in Settings';
+    btnOpenDashboard.setAttribute('aria-label', 'Open workspace · Backend offline');
     storage.setBackendStatus('disconnected');
   }
 
@@ -306,72 +374,34 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function renderEarthWindowBar(wins: chrome.windows.Window[]) {
-    const earthBar = document.getElementById('earth-window-bar');
-    if (!earthBar) return;
-
-    if (wins.length <= 1) {
-      earthBar.style.display = 'none';
-      earthBar.innerHTML = '';
-      return;
-    }
-
-    earthBar.style.display = 'flex';
-    earthBar.innerHTML = '';
-
-    const activeIconUrl = chrome.runtime?.getURL ? chrome.runtime.getURL('icons/earth_active_clean.png') : 'icons/earth_active_clean.png';
-    const barrenIconUrl = chrome.runtime?.getURL ? chrome.runtime.getURL('icons/earth_barren_clean.png') : 'icons/earth_barren_clean.png';
-
-    // Sort deterministically so Earth-616 is consistently the first window (Blue theme)
-    // and Earth-101 is consistently the second window (Red theme)
-    const sortedWins = wins.slice().sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
-
-    sortedWins.forEach((win, index) => {
-      if (!win.id) return;
-      const isCurrent = win.id === selectedWindowId;
-      const earthName = MARVEL_EARTH_NAMES[index % MARVEL_EARTH_NAMES.length];
-      const tabCount = win.tabs ? win.tabs.length : 0;
-
-      // Keep Earth identity constant per window (Earth-616 = Blue/Cyan lush cube, Earth-101 = Red/Magma barren cube)
-      const isBlue = (index % 2 === 0);
-      const earthIconUrl = isBlue ? activeIconUrl : barrenIconUrl;
-      const themeClass = isBlue ? 'theme-blue' : 'theme-red';
-
-      const tabBtn = document.createElement('div');
-      tabBtn.className = `earth-tab ${themeClass} ${isCurrent ? 'active' : 'inactive'}`;
-      tabBtn.setAttribute('data-window-id', String(win.id));
-      tabBtn.setAttribute('title', `${earthName} (${tabCount} tabs) - ${isCurrent ? 'Active Window' : (win.state === 'minimized' ? 'Minimized — Click to Restore & Swap' : 'Click to Switch & Swap')}`);
-
-      const iconImg = document.createElement('img');
-      iconImg.className = 'earth-cube-icon';
-      iconImg.src = earthIconUrl;
-      iconImg.alt = earthName;
-
-      const labelSpan = document.createElement('span');
-      labelSpan.className = 'earth-tab-name';
-      labelSpan.textContent = earthName;
-
-      const badgeSpan = document.createElement('span');
-      badgeSpan.className = 'earth-tab-badge';
-      badgeSpan.textContent = `${tabCount}`;
-
-      tabBtn.appendChild(iconImg);
-      tabBtn.appendChild(labelSpan);
-      tabBtn.appendChild(badgeSpan);
-
-      tabBtn.addEventListener('click', async (e) => {
-        e.stopPropagation();
-        if (win.id) {
-          await switchAndSwapWindow(win.id);
-        }
-      });
-
-      earthBar.appendChild(tabBtn);
+    // Keep the existing switch/swap behavior behind the compact window picker.
+    const sorted = wins.slice().sort((a, b) => (a.id ?? 0) - (b.id ?? 0));
+    windowPicker.replaceChildren();
+    sorted.forEach((win, index) => {
+      const option = document.createElement('option');
+      option.value = String(win.id);
+      option.textContent = sorted.length === 1 ? 'Current window' : `Window ${index + 1}`;
+      option.selected = win.id === selectedWindowId;
+      windowPicker.appendChild(option);
     });
+    if (!sorted.length) {
+      const option = document.createElement('option'); option.textContent = 'Current window';
+      windowPicker.appendChild(option);
+    }
+    windowPicker.disabled = sorted.length < 2;
   }
 
   // 3. Query Tabs & Tab Groups
   async function refreshTabsFromChrome() {
     try {
+      if(!savedStatusKnown){
+        const cached=await cacheForBackend<any[]>('saved-status');
+        if(cached){savedStatusKnown=true;cached.forEach(row=>savedLibraryUrlSet.add(normalizeUrl(row.url_normalized||row.url_original)));}
+        for(const job of await pendingSaves()){
+          if(job.kind==='page'||job.kind==='note')savedLibraryUrlSet.add(normalizeUrl(job.payload.url_original||job.payload.video_url));
+          if(job.kind==='remove-page')savedLibraryUrlSet.delete(normalizeUrl(job.payload.url));
+        }
+      }
       try {
         normalWindows = await chrome.windows.getAll({ windowTypes: ['normal'], populate: true });
       } catch (winErr) {
@@ -439,36 +469,20 @@ document.addEventListener('DOMContentLoaded', async () => {
         if (storedConfig) {
           termConfig = storedConfig;
         } else {
-          const apiConfig = await apiClient.get<TerminatorConfig>('/api/terminator/rules');
-          if (apiConfig && typeof apiConfig.terminate_new_tabs === 'boolean') {
-            termConfig = apiConfig;
-            await storage.set('terminator_config', apiConfig);
-          }
+          void apiClient.get<TerminatorConfig>('/api/terminator/rules').then(config=>storage.set('terminator_config',config)).catch(()=>{});
+
         }
       } catch {
         // fallback to default
       }
 
-      // Fetch saved library pages to check which open tabs are already saved
-      let savedUrlSet = new Set<string>();
-      try {
-        const savedPages = await apiClient.get<any[]>('/api/pages?limit=1000');
-        if (Array.isArray(savedPages)) {
-          savedPages.forEach(p => {
-            if (p.url_normalized) savedUrlSet.add(p.url_normalized);
-            if (p.url_original) savedUrlSet.add(normalizeUrl(p.url_original));
-          });
-          savedLibraryUrlSet = savedUrlSet;
-        }
-      } catch {
-        // offline fallback
-      }
-
+      const savedUrlSet=new Set(savedLibraryUrlSet);
+      const savedTopics=new Map<string,string>();
       const urlCountMap = new Map<string, number>();
       allOpenTabs = rawTabs.map(t => {
         const norm = normalizeUrl(t.url || '');
         urlCountMap.set(norm, (urlCountMap.get(norm) || 0) + 1);
-        return { ...t, normalizedUrl: norm };
+        return { ...t, normalizedUrl: norm, savedTopic: savedTopics.get(norm) };
       });
 
       let excessDuplicateCopies = 0;
@@ -509,7 +523,9 @@ document.addEventListener('DOMContentLoaded', async () => {
                            customTargetCount;
 
       if (totalClutter > 0) {
-        dupBanner.style.display = 'flex';
+        cleanupReview.hidden = false;
+        cleanupReview.title = `Review ${totalClutter} clutter tabs`;
+        cleanupReview.setAttribute('aria-label', cleanupReview.title);
         const details: string[] = [];
         if (excessDuplicateCopies > 0) details.push(`${excessDuplicateCopies} extra duplicates`);
         if (termConfig.terminate_new_tabs && newTabCount > 0) details.push(`${newTabCount} new tabs`);
@@ -518,21 +534,26 @@ document.addEventListener('DOMContentLoaded', async () => {
         dupText.textContent = `${totalClutter} clutter tabs (${details.join(', ')})`;
       } else {
         dupBanner.style.display = 'none';
+        cleanupReview.hidden = true;
       }
+      popupTotal.textContent = `${allOpenTabs.length} tab${allOpenTabs.length === 1 ? '' : 's'}`;
 
       totalCountSpan.textContent = String(allOpenTabs.length);
       renderTabs();
       updateSelectionUI();
+      if (companionReady) {
+        updateCompanionBadges();
+        if (companionNotesModal.style.display === 'flex') renderCompanionNotesList();
+        void pollActiveVideo();
+      }
     } catch (err) {
       loading.textContent = 'Error loading tabs.';
       console.error(err);
     }
   }
 
-  await Promise.all([
-    refreshTabsFromChrome(),
-    loadSavedGroups()
-  ]);
+  await refreshTabsFromChrome();
+  void loadSavedGroups();
   updateGroupBadges();
 
   dupClose.addEventListener('click', () => {
@@ -741,7 +762,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     if (res?.success) {
       recoveryBanner.style.display = 'none';
       activeRecoverySession = null;
-      window.close();
+      closePopup();
     } else {
       showToast(res?.error === 'timeout' ? 'Restore timed out — try again' : 'Restore failed', 'error');
       if (recoveryActionText) recoveryActionText.textContent = originalText;
@@ -789,8 +810,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const res = await sendMessageWithTimeout({ type: 'RESTORE_CLOSED_WINDOW', session });
         if (res?.success) {
           winHistoryModal.style.display = 'none';
-          closedWinBanner.style.display = 'none';
-          window.close();
+          recoveryBanner.style.display = 'none';
+          closePopup();
         } else {
           restoreBtn.textContent = '✦ Reincarnate';
           restoreBtn.disabled = false;
@@ -828,7 +849,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (savedUrls.size > 0) {
         const matches = cgTabs.filter(t => {
           const u = (t.url || '').trim().toLowerCase();
-          const norm = (t.url_normalized || '').trim().toLowerCase();
+          const norm = (t.normalizedUrl || '').trim().toLowerCase();
           return savedUrls.has(u) || (norm && savedUrls.has(norm));
         });
         if (matches.length > 0 && (matches.length === cgTabs.length || matches.length === savedUrls.size)) {
@@ -857,6 +878,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   function switchToMode(mode: 'library' | 'group') {
     currentMode = mode;
+    selectionMode = false;
     selectedTabIds.clear();
     selectedSavedTabKeys.clear();
     selectedGroupKeys.clear();
@@ -1181,26 +1203,12 @@ document.addEventListener('DOMContentLoaded', async () => {
         }));
 
         try {
-          let savedResult: any = null;
-          try {
-            savedResult = await apiClient.post('/api/groups', {
-              name,
-              color: safeColor,
-              tabs: newGroupTabsPayload
-            });
-          } catch {
-            savedResult = {
-              id: Date.now(),
-              name,
-              color: safeColor,
-              tab_count: newGroupTabsPayload.length,
-              tabs: newGroupTabsPayload,
-              created_at: new Date().toISOString()
-            };
-          }
-          const cached = (await storage.get<any[]>('saved_tab_groups')) || [];
+          const job=await saveOnDevice('group',{name,color:safeColor,tabs:newGroupTabsPayload});
+          const savedResult={...job.payload,id:'pending:'+job.payload.client_id,tab_count:newGroupTabsPayload.length,pendingSync:true};
+          let cached = (await storage.get<any[]>('saved_tab_groups')) || [];
+
           cached.unshift(savedResult);
-          await storage.set('saved_tab_groups', cached);
+          await storage.set('saved_tab_groups', cached).catch(()=>{});
           allSavedGroups = cached;
         } catch (saveErr) {
           console.debug('Failed to save newly created group in Karl X:', saveErr);
@@ -1241,18 +1249,13 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // Saved Groups loading & rendering
-  async function loadSavedGroups(): Promise<any[]> {
-    try {
-      const apiGroups = await apiClient.get<any[]>('/api/groups');
-      if (Array.isArray(apiGroups)) {
-        allSavedGroups = apiGroups;
-        await storage.set('saved_tab_groups', apiGroups);
-        return apiGroups;
-      }
-    } catch {}
-    const cached = (await storage.get<any[]>('saved_tab_groups')) || [];
-    allSavedGroups = cached;
-    return cached;
+  async function loadSavedGroups():Promise<any[]>{
+    let groups=await cacheForBackend<any[]>('groups')||(await storage.get<any[]>('saved_tab_groups'))||[];
+    try{groups=await apiClient.get<any[]>('/api/groups');await cacheForBackend('groups',groups);}catch{}
+    const jobs=(await pendingSaves()).filter(job=>job.kind==='group');
+    const pending=jobs.filter(job=>!groups.some(group=>group.name===job.payload.name&&JSON.stringify(group.tabs)===JSON.stringify(job.payload.tabs))).map(job=>({...job.payload,id:'pending:'+job.payload.client_id,tab_count:job.payload.tabs.length,pendingSync:true}));
+    allSavedGroups=[...pending,...groups];await storage.set('saved_tab_groups',allSavedGroups);updateGroupBadges();
+    if(currentMode==='group')renderTabs();return allSavedGroups;
   }
 
   function createTabLibraryActionButton(url: string, title?: string, faviconUrl?: string, onToggled?: (saved: boolean) => void): HTMLElement {
@@ -1275,6 +1278,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (currentlySaved) {
         try {
           await apiClient.delete(`/api/pages/by-url?url=${encodeURIComponent(url || '')}`);
+          await removeLocalNotesForUrl(url || '');
           savedLibraryUrlSet.delete(norm);
           actionBtn.className = 'btn-lib-action add';
           actionBtn.innerHTML = '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1V9M1 5H9" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/></svg>';
@@ -1283,28 +1287,30 @@ document.addEventListener('DOMContentLoaded', async () => {
           showToast('Removed from Library', 'info');
         } catch (err) {
           console.error('Failed to remove page from library', err);
+          showToast('Could not remove this page. Try again.');
         }
       } else {
         try {
           let dom = '';
           try { if (url) dom = new URL(url).hostname.replace(/^www\./, ''); } catch {}
-          await apiClient.post('/api/pages/save-bulk', {
-            tabs: [{
+          const liveTab=allOpenTabs.find(tab => tab.normalizedUrl === norm);
+          const capturedTitle=liveTab ? await readableTabTitle(liveTab) : title;
+          await savePagesOnDevice([{
               url_original: url || '',
               url_normalized: norm,
-              title: title || dom || 'Untitled',
+              title: capturedTitle || dom || 'Untitled',
               favicon_url: faviconUrl || '',
               domain: dom
-            }]
-          });
+            }]);
           savedLibraryUrlSet.add(norm);
           actionBtn.className = 'btn-lib-action remove';
           actionBtn.innerHTML = '<svg width="10" height="2" viewBox="0 0 10 2" fill="none"><rect width="10" height="2" rx="1" fill="#FFFFFF"/></svg>';
           actionBtn.title = 'Remove from Karl X Library';
           onToggled?.(true);
-          showToast('Saved to Library', 'success');
+          showToast('Saved on this device. Uploading when connected.', 'info');
         } catch (err) {
           console.error('Failed to save page to library', err);
+          showToast('Could not save this page. Try again.');
         }
       }
       actionBtn.disabled = false;
@@ -1324,27 +1330,12 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     try {
       const groupName = group.title || 'Chrome Group';
-      let savedResult: any = null;
-      try {
-        savedResult = await apiClient.post('/api/groups', {
-          name: groupName,
-          color: group.color || 'blue',
-          tabs: tabsPayload
-        });
-      } catch {
-        savedResult = {
-          id: Date.now(),
-          name: groupName,
-          color: group.color || 'blue',
-          tab_count: tabsPayload.length,
-          tabs: tabsPayload,
-          created_at: new Date().toISOString()
-        };
-      }
+      const job=await saveOnDevice('group',{name:groupName,color:group.color||'blue',tabs:tabsPayload});
+      const savedResult={...job.payload,id:'pending:'+job.payload.client_id,tab_count:tabsPayload.length,pendingSync:true};
+      let cached = (await storage.get<any[]>('saved_tab_groups')) || [];
 
-      const cached = (await storage.get<any[]>('saved_tab_groups')) || [];
       cached.unshift(savedResult);
-      await storage.set('saved_tab_groups', cached);
+      await storage.set('saved_tab_groups', cached).catch(()=>{});
       allSavedGroups = cached;
 
 
@@ -1432,7 +1423,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const statusPill = document.createElement('span');
     statusPill.className = 'group-status-pill saved';
-    statusPill.textContent = 'Saved';
+    statusPill.textContent = group.pendingSync?'Pending upload':'Saved';
 
     const timeDiv = document.createElement('div');
     timeDiv.className = 'saved-group-time';
@@ -1443,6 +1434,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     removeBtn.className = 'btn-lib-action remove';
     removeBtn.innerHTML = '<svg width="10" height="2" viewBox="0 0 10 2" fill="none"><rect width="10" height="2" rx="1" fill="#FFFFFF"/></svg>';
     removeBtn.title = 'Unsave group from Database';
+    removeBtn.disabled=!!group.pendingSync;
     removeBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       removeBtn.disabled = true;
@@ -1452,7 +1444,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // 1. Remove from Saved Groups in database
       try {
         await apiClient.delete(`/api/groups/${group.id}`);
-      } catch {}
+      } catch {removeBtn.disabled=false;showToast('Could not remove this collection. It is still saved.','error');return;}
       allSavedGroups = allSavedGroups.filter(g => g.id !== group.id);
       await storage.set('saved_tab_groups', allSavedGroups);
 
@@ -1492,6 +1484,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     exportBtn.className = 'btn-saved-action';
     exportBtn.innerHTML = '<span>⇩ HTML</span>';
     exportBtn.title = 'Download offline HTML export for this group';
+    exportBtn.disabled=!!group.pendingSync;
     exportBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
       exportBtn.disabled = true;
@@ -1566,17 +1559,14 @@ document.addEventListener('DOMContentLoaded', async () => {
     tabs.forEach((tab: any, idx: number) => {
       const tabUrl = tab.url || tab.url_original || '';
       const tabKey = `${group.id}:::${idx}:::${tabUrl}`;
-      const tabId = tab.id !== undefined ? tab.id : (allOpenTabs.find(ot => ot.url === tabUrl || ot.url_normalized === tabUrl)?.id);
+      const tabId = tab.id !== undefined ? tab.id : (allOpenTabs.find(ot => ot.url === tabUrl || ot.normalizedUrl === tabUrl)?.id);
       const isChecked = (tabId !== undefined && selectedTabIds.has(tabId)) || selectedSavedTabKeys.has(tabKey);
 
       const tabEl = document.createElement('div');
       tabEl.className = `tab-item ${isChecked ? 'checked' : ''}`;
       tabEl.style.paddingLeft = '14px';
 
-      const favicon = document.createElement('img');
-      favicon.className = 'tab-favicon';
-      favicon.src = tab.favIconUrl || tab.favicon_url || 'public/icons/icon16.png';
-      favicon.onerror = () => { favicon.src = 'public/icons/icon16.png'; };
+      const favicon = createSiteIcon(tabUrl, tab.favIconUrl || tab.favicon_url);
 
       const title = document.createElement('div');
       title.className = 'tab-title';
@@ -1586,9 +1576,6 @@ document.addEventListener('DOMContentLoaded', async () => {
       tabEl.appendChild(favicon);
       tabEl.appendChild(title);
 
-      if (tab.active) {
-        tabEl.appendChild(createPokeballIndicator(tab));
-      }
 
       const libBtn = createTabLibraryActionButton(tabUrl, tab.title, tab.favIconUrl || tab.favicon_url);
       tabEl.appendChild(libBtn);
@@ -1596,6 +1583,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Single-click toggles selection of this individual tab
       tabEl.addEventListener('click', (e) => {
         e.stopPropagation();
+        if (!selectionMode) { void activateOpenTab(tabId); return; }
         const nowChecked = !tabEl.classList.contains('checked');
         tabEl.classList.toggle('checked', nowChecked);
         if (nowChecked) {
@@ -1614,13 +1602,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       // Double-click switches to or opens tab in Chrome
       tabEl.addEventListener('dblclick', async (e) => {
         e.stopPropagation();
+        if (selectionMode) return;
         if (tabId !== undefined) {
           try {
             await chrome.tabs.update(tabId, { active: true });
             if (tab.windowId !== undefined) {
               await chrome.windows.update(tab.windowId, { focused: true });
             }
-            window.close();
+            closePopup();
           } catch {}
         }
       });
@@ -1636,7 +1625,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     let collapsed = false;
     header.addEventListener('click', (e) => {
       const target = e.target as HTMLElement;
-      if (target.closest('.chevron')) {
+      if (target.closest('.chevron') || !selectionMode) {
         collapsed = !collapsed;
         body.style.display = collapsed ? 'none' : '';
         chevron.classList.toggle('collapsed', collapsed);
@@ -1655,7 +1644,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         tabs.forEach((t: any, idx: number) => {
           const tUrl = t.url || t.url_original || '';
           selectedSavedTabKeys.add(`${group.id}:::${idx}:::${tUrl}`);
-          const tId = t.id !== undefined ? t.id : allOpenTabs.find(ot => ot.url === tUrl || ot.url_normalized === tUrl)?.id;
+          const tId = t.id !== undefined ? t.id : allOpenTabs.find(ot => ot.url === tUrl || ot.normalizedUrl === tUrl)?.id;
           if (tId !== undefined) selectedTabIds.add(tId);
         });
         tabsList.querySelectorAll('.tab-item').forEach(el => el.classList.add('checked'));
@@ -1666,7 +1655,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         tabs.forEach((t: any, idx: number) => {
           const tUrl = t.url || t.url_original || '';
           selectedSavedTabKeys.delete(`${group.id}:::${idx}:::${tUrl}`);
-          const tId = t.id !== undefined ? t.id : allOpenTabs.find(ot => ot.url === tUrl || ot.url_normalized === tUrl)?.id;
+          const tId = t.id !== undefined ? t.id : allOpenTabs.find(ot => ot.url === tUrl || ot.normalizedUrl === tUrl)?.id;
           if (tId !== undefined) selectedTabIds.delete(tId);
         });
         tabsList.querySelectorAll('.tab-item').forEach(el => el.classList.remove('checked'));
@@ -1855,10 +1844,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         tabEl.className = `tab-item ${isChecked ? 'checked' : ''}`;
         tabEl.style.paddingLeft = '14px';
 
-        const fav = document.createElement('img');
-        fav.className = 'tab-favicon';
-        fav.src = tab.favIconUrl || 'public/icons/icon16.png';
-        fav.onerror = () => { fav.src = 'public/icons/icon16.png'; };
+        const fav = createSiteIcon(tab.url || '', tab.favIconUrl);
 
         const tit = document.createElement('div');
         tit.className = 'tab-title';
@@ -1869,12 +1855,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         tabEl.appendChild(tit);
 
         // Circular +/- button for tab library status
-        const libBtn = createTabLibraryActionButton(tab.url, tab.title, tab.favIconUrl);
+        const libBtn = createTabLibraryActionButton(tab.url || '', tab.title, tab.favIconUrl);
         tabEl.appendChild(libBtn);
 
         // Single-click toggles selection of this tab
         tabEl.addEventListener('click', (e) => {
           e.stopPropagation();
+          if (!selectionMode) { void activateOpenTab(tab.id); return; }
           if (tab.id === undefined) return;
           const nowChecked = !tabEl.classList.contains('checked');
           tabEl.classList.toggle('checked', nowChecked);
@@ -1892,13 +1879,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Double-click switches directly to tab in Chrome
         tabEl.addEventListener('dblclick', async (e) => {
           e.stopPropagation();
+          if (selectionMode) return;
           if (tab.id !== undefined) {
             try {
               await chrome.tabs.update(tab.id, { active: true });
               if (tab.windowId !== undefined) {
                 await chrome.windows.update(tab.windowId, { focused: true });
               }
-              window.close();
+              closePopup();
             } catch {}
           }
         });
@@ -1912,7 +1900,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       let collapsed = false;
       header.addEventListener('click', (e) => {
         const target = e.target as HTMLElement;
-        if (target.closest('.chevron')) {
+        if (target.closest('.chevron') || !selectionMode) {
           collapsed = !collapsed;
           body.style.display = collapsed ? 'none' : '';
           chevron.classList.toggle('collapsed', collapsed);
@@ -2007,10 +1995,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         tabEl.className = `tab-item ${isChecked ? 'checked' : ''}`;
         tabEl.style.paddingLeft = '14px';
 
-        const fav = document.createElement('img');
-        fav.className = 'tab-favicon';
-        fav.src = tab.favIconUrl || 'public/icons/icon16.png';
-        fav.onerror = () => { fav.src = 'public/icons/icon16.png'; };
+        const fav = createSiteIcon(tab.url || '', tab.favIconUrl);
 
         const tit = document.createElement('div');
         tit.className = 'tab-title';
@@ -2019,12 +2004,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         tabEl.appendChild(fav);
         tabEl.appendChild(tit);
 
-        const libBtn = createTabLibraryActionButton(tab.url, tab.title, tab.favIconUrl);
+        const libBtn = createTabLibraryActionButton(tab.url || '', tab.title, tab.favIconUrl);
         tabEl.appendChild(libBtn);
 
         // Single-click toggles selection of ungrouped tab
         tabEl.addEventListener('click', (e) => {
           e.stopPropagation();
+          if (!selectionMode) { void activateOpenTab(tab.id); return; }
           if (tab.id === undefined) return;
           const nowChecked = !tabEl.classList.contains('checked');
           tabEl.classList.toggle('checked', nowChecked);
@@ -2036,13 +2022,14 @@ document.addEventListener('DOMContentLoaded', async () => {
         // Double-click switches directly to tab in Chrome
         tabEl.addEventListener('dblclick', async (e) => {
           e.stopPropagation();
+          if (selectionMode) return;
           if (tab.id !== undefined) {
             try {
               await chrome.tabs.update(tab.id, { active: true });
               if (tab.windowId !== undefined) {
                 await chrome.windows.update(tab.windowId, { focused: true });
               }
-              window.close();
+              closePopup();
             } catch {}
           }
         });
@@ -2082,40 +2069,117 @@ document.addEventListener('DOMContentLoaded', async () => {
     return getChromeColorHex(colorName);
   }
 
+  function matchingLibraryTabs(): ExtendedTab[] {
+    return allOpenTabs.filter(tab => !tab.isNewTab &&
+      `${tab.title || ''} ${tab.savedTopic || ''} ${tab.url || ''}`.toLowerCase().includes(tabSearchQuery));
+  }
+
   function renderTabs() {
-    if (currentMode === 'group') {
+    const list=document.getElementById('main-content');
+    const listBounds=list?.getBoundingClientRect();
+    const visibleRows=listBounds?[...container.querySelectorAll<HTMLElement>('.library-item')].filter(row=>{const bounds=row.getBoundingClientRect();return bounds.bottom>listBounds.top&&bounds.top<listBounds.bottom;}):[];
+    const anchor=visibleRows.find(row=>row.classList.contains('active-tab'))||visibleRows[0];
+    const anchorId=anchor?.dataset.tabId,anchorTop=anchor?.getBoundingClientRect().top;
+    const libraryMode = currentMode === 'library';
+    statusFilters.hidden = !libraryMode;
+    document.getElementById('popup-search-wrap')!.hidden = !libraryMode;
+    btnSaveSelected.hidden = !libraryMode || !selectionMode;
+    segLibrary.setAttribute('aria-pressed', String(libraryMode));
+    segGroup.setAttribute('aria-pressed', String(!libraryMode));
+    if (!libraryMode) {
       updateGroupBadges();
-      if (currentGroupSubtab === 'saved') {
-        renderSavedGroups();
-      } else {
-        renderUnsavedGroups();
-      }
+      if (currentGroupSubtab === 'saved') renderSavedGroups();
+      else renderUnsavedGroups();
       return;
     }
-
-    // Library Mode: 2 boxes — 'Not Saved' and 'Saved'
+    const matching = matchingLibraryTabs();
+    const saved = matching.filter(tab => tab.isSavedInLibrary);
+    const unsaved = matching.filter(tab => !tab.isSavedInLibrary);
+    document.getElementById('popup-all-count')!.textContent = String(matching.length);
+    document.getElementById('popup-saved-count')!.textContent = String(saved.length);
+    document.getElementById('popup-unsaved-count')!.textContent = String(unsaved.length);
+    statusFilters.querySelectorAll<HTMLButtonElement>('[data-save-status]').forEach(button => {
+      button.setAttribute('aria-pressed', String(button.dataset.saveStatus === saveStatus));
+    });
     const fragment = document.createDocumentFragment();
-    const unsavedTabs = allOpenTabs.filter(t => !t.isSavedInLibrary && !t.isNewTab);
-    const savedTabs = allOpenTabs.filter(t => t.isSavedInLibrary);
-
-    fragment.appendChild(createGroupCard({
-      name: 'Not Saved', color: '#f97316', tabs: unsavedTabs,
-      libraryMode: { isSavedGroup: false, emptyText: 'All open tabs are saved in library! ✨' }
+    if (saveStatus !== 'unsaved') fragment.appendChild(createGroupCard({
+      name: 'Saved to library', color: '#90c9a3', tabs: saved,
+      libraryMode: { isSavedGroup: true, emptyText: 'No saved tabs in this window yet.' }
     }));
-    fragment.appendChild(createGroupCard({
-      name: 'Saved', color: '#10b981', tabs: savedTabs,
-      libraryMode: { isSavedGroup: true, emptyText: 'No open tabs saved in library yet.' }
+    if (saveStatus !== 'saved') fragment.appendChild(createGroupCard({
+      name: savedStatusKnown?'Not saved':'Open tabs · Saved status unknown', color: '#b7b0c3', tabs: unsaved,
+      libraryMode: { isSavedGroup: false, emptyText: matching.length ? 'All matching tabs are saved.' : 'No matching open tabs.' }
     }));
-
     container.replaceChildren(fragment);
+    updateRowAccessibility();
+    if(list&&anchorId&&anchorTop!==undefined&&!openingRevealRunning&&!revealActiveTabOnOpen){
+      const replacement=container.querySelector<HTMLElement>(`[data-tab-id="${anchorId}"]`);
+      if(replacement)list.scrollTop+=replacement.getBoundingClientRect().top-anchorTop;
+    }
+    if (revealActiveTabOnOpen && container.querySelector('.active-tab')) {
+      revealActiveTabOnOpen = false;
+      openingRevealRunning=true;
+      requestAnimationFrame(() => {
+        // Scroll only the tab list, never the webpage hosting the floating panel.
+        // Resolve the row again in case another render happened before this frame.
+        const row = container.querySelector<HTMLElement>('.active-tab');
+        const list = document.getElementById('main-content');
+        if (!row || !list) return;
+        const target=()=>{
+          const current=container.querySelector<HTMLElement>('.active-tab');if(!current)return list.scrollTop;
+          const bounds=current.getBoundingClientRect();return Math.max(0,Math.min(list.scrollHeight-list.clientHeight,list.scrollTop+bounds.top-list.getBoundingClientRect().top-(list.clientHeight-bounds.height)/2));
+        };
+        list.scrollTop = 0;
+        if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+          list.scrollTop = target();openingRevealRunning=false;
+          return;
+        }
+        // Show the top first, then make the opening reveal a short eased scroll.
+        // Any deliberate interaction takes control back immediately.
+        let frame = 0, started: number | null = null;
+        const interruptEvents = ['wheel', 'touchstart', 'pointerdown', 'keydown'];
+        const stop = () => {
+          openingRevealRunning=false;
+          cancelAnimationFrame(frame);
+          interruptEvents.forEach(type => list.removeEventListener(type, stop));
+        };
+        const step = (now: number) => {
+          if (!list.isConnected) { stop(); return; }
+          started ??= now;
+          const progress = Math.min(1, (now - started) / 360);
+          list.scrollTop = target() * (1 - Math.pow(1 - progress, 3));
+          if (progress < 1) frame = requestAnimationFrame(step);
+          else stop();
+        };
+        interruptEvents.forEach(type => list.addEventListener(type, stop, { passive: true }));
+        frame = requestAnimationFrame(step);
+      });
+    }
+  }
 
-    // Auto-scroll active tab into view if needed
-    setTimeout(() => {
-      const activeEl = container.querySelector('.tab-item.active-tab');
-      if (activeEl) {
-        activeEl.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-      }
-    }, 60);
+  async function activateOpenTab(tabId: number | undefined) {
+    if (tabId === undefined) return;
+    try {
+      const tab = await chrome.tabs.update(tabId, { active: true });
+      const windowId = tab?.windowId ?? allOpenTabs.find(t => t.id === tabId)?.windowId;
+      if (windowId !== undefined) await chrome.windows.update(windowId, { focused: true });
+      closePopup();
+    } catch {
+      showToast('Could not switch to this tab. It may have closed.', 'error');
+    }
+  }
+
+  function appendCurrentTabMarker(item: HTMLElement, tab: chrome.tabs.Tab | undefined) {
+    if (!tab?.active) return;
+    item.classList.add('active-tab');
+    item.setAttribute('aria-current', 'page');
+    const marker = document.createElement('span');
+    marker.className = 'tab-pokeball-indicator';
+    marker.title = 'Current tab';
+    marker.setAttribute('role', 'img');
+    marker.setAttribute('aria-label', 'Current tab');
+    marker.innerHTML = '<svg class="pokeball-svg" viewBox="0 0 20 20" aria-hidden="true"><circle cx="10" cy="10" r="8.5" fill="#f5f3ed" stroke="#24252a" stroke-width="1.5"/><path d="M1.5 10a8.5 8.5 0 0 1 17 0Z" fill="#ed4c51"/><path d="M1.5 10h17" stroke="#24252a" stroke-width="2"/><circle cx="10" cy="10" r="3" fill="#f5f3ed" stroke="#24252a" stroke-width="1.8"/></svg>';
+    item.appendChild(marker);
   }
 
   interface GroupCardOptions {
@@ -2133,7 +2197,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const { name, color, rawColorName, tabs, libraryMode, flat } = opts;
 
     const card = document.createElement('div');
-    card.className = 'group-card';
+    card.className = `group-card ${libraryMode ? (libraryMode.isSavedGroup ? 'library-saved' : 'library-unsaved') : ''}`;
     card.style.borderLeftColor = color;
     card.style.background = `linear-gradient(90deg, ${hexToRgba(color, 0.10)}, var(--surface) 45%)`;
 
@@ -2148,7 +2212,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const countDiv = document.createElement('div');
     countDiv.className = 'group-count';
-    countDiv.textContent = `(${tabs.length})`;
+    countDiv.textContent = libraryMode ? String(tabs.length) : `(${tabs.length})`;
 
     header.appendChild(titleDiv);
     header.appendChild(countDiv);
@@ -2172,7 +2236,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     const chevron = document.createElement('div');
     chevron.className = 'chevron';
     chevron.textContent = '▾';
-    header.appendChild(chevron);
+    if (!libraryMode) header.appendChild(chevron);
 
     const body = document.createElement('div');
     if (tabs.length === 0) {
@@ -2204,61 +2268,35 @@ document.addEventListener('DOMContentLoaded', async () => {
     return card;
   }
 
-  function createPokeballIndicator(tab: ExtendedTab): HTMLElement {
-    const el = document.createElement('div');
-    el.className = 'tab-pokeball-indicator';
-    el.title = 'Currently open tab (Active)';
-    el.innerHTML = `
-      <svg class="pokeball-svg" viewBox="0 0 24 24" width="16" height="16" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M 2 12 A 10 10 0 0 1 22 12 Z" fill="#EE1515"/>
-        <path d="M 2 12 A 10 10 0 0 0 22 12 Z" fill="#FFFFFF"/>
-        <path d="M 3.8 14.5 A 10 10 0 0 0 20.2 14.5 A 9 6.5 0 0 1 3.8 14.5 Z" fill="#CBD5E1" opacity="0.6"/>
-        <line x1="2" y1="12" x2="22" y2="12" stroke="#18181B" stroke-width="2.2"/>
-        <circle cx="12" cy="12" r="10" stroke="#18181B" stroke-width="2.2" fill="none"/>
-        <circle cx="12" cy="12" r="3.4" fill="#FFFFFF" stroke="#18181B" stroke-width="2.2"/>
-        <circle cx="12" cy="12" r="1.4" fill="#FFFFFF" stroke="#71717A" stroke-width="0.75"/>
-      </svg>
-    `;
-
-    el.addEventListener('click', async (e) => {
-      e.stopPropagation();
-      if (tab.id !== undefined) {
-        try {
-          await chrome.tabs.update(tab.id, { active: true });
-          if (tab.windowId !== undefined) {
-            await chrome.windows.update(tab.windowId, { focused: true });
-          }
-        } catch (err) {
-          console.error('Failed to focus tab:', err);
-        }
-      }
-    });
-
-    return el;
-  }
-
   function createLibraryTabItem(tab: ExtendedTab, isSavedGroup: boolean): HTMLElement {
     const isChecked = tab.id ? selectedTabIds.has(tab.id) : false;
     const item = document.createElement('div');
     item.className = `tab-item library-item ${isChecked ? 'checked' : ''} ${tab.active ? 'active-tab' : ''}`;
     item.style.paddingLeft = '14px';
+    item.dataset.saved = String(isSavedGroup);
 
-    const favicon = document.createElement('img');
-    favicon.className = 'tab-favicon';
-    favicon.src = tab.favIconUrl || 'public/icons/icon16.png';
-    favicon.onerror = () => { favicon.src = 'public/icons/icon16.png'; };
-
-    const title = document.createElement('div');
-    title.className = 'tab-title';
-    title.textContent = tab.title || tab.url || 'Untitled';
-    title.title = tab.url || '';
+    item.dataset.tabId = String(tab.id || '');
+    if (tab.active) item.setAttribute('aria-current', 'page');
+    const avatar = document.createElement('span');
+    avatar.className = 'tab-avatar';
+    avatar.setAttribute('aria-hidden', 'true');
+    avatar.appendChild(createSiteIcon(tab.url || '', tab.favIconUrl, 'website-favicon'));
+    const copy = document.createElement('div'); copy.className = 'tab-copy';
+    const title = document.createElement('div'); title.className = 'tab-title';
+    title.textContent = tab.title || 'Untitled tab'; title.title = tab.url || '';
+    const subtitle = document.createElement('div'); subtitle.className = 'tab-subtitle';
+    let domain = '';
+    try { domain = new URL(tab.url || '').hostname.replace(/^www\./, ''); } catch {}
+    subtitle.textContent = tab.pendingSave?'Saved on device · Pending upload':tab.savedTopic || domain || 'Browser tab';
+    copy.append(title, subtitle);
 
     const actionBtn = document.createElement('button');
     actionBtn.className = `btn-lib-action ${isSavedGroup ? 'remove' : 'add'}`;
     actionBtn.innerHTML = isSavedGroup
       ? '<svg width="10" height="2" viewBox="0 0 10 2" fill="none"><rect width="10" height="2" rx="1" fill="#FFFFFF"/></svg>'
       : '<svg width="10" height="10" viewBox="0 0 10 10" fill="none"><path d="M5 1V9M1 5H9" stroke="#FFFFFF" stroke-width="2" stroke-linecap="round"/></svg>';
-    actionBtn.title = isSavedGroup ? 'Remove from Karl X Library' : 'Save to Karl X Library';
+    actionBtn.title = isSavedGroup ? 'Remove from library' : 'Save to library';
+    actionBtn.setAttribute('aria-label', actionBtn.title);
 
     actionBtn.addEventListener('click', async (e) => {
       e.stopPropagation();
@@ -2268,12 +2306,14 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (isSavedGroup) {
         // Remove from library
         try {
-          await apiClient.delete(`/api/pages/by-url?url=${encodeURIComponent(tab.url || '')}`);
+          await removeSavedUrl(tab.url||'');
+          await removeLocalNotesForUrl(tab.url || '');
           tab.isSavedInLibrary = false;
           if (tab.url) savedLibraryUrlSet.delete(normalizeUrl(tab.url));
-          renderTabs();
+          renderTabs(); updateSelectionUI();
         } catch (err) {
           console.error('Failed to remove page from library', err);
+          showToast('Could not remove this page. Try again.');
         }
       } else {
         // Add to library
@@ -2284,26 +2324,29 @@ document.addEventListener('DOMContentLoaded', async () => {
           } catch {}
 
           const norm = tab.normalizedUrl || normalizeUrl(tab.url || '');
-          await apiClient.post('/api/pages/save-bulk', {
-            tabs: [{
+          const capturedTitle=await readableTabTitle(tab);
+          await savePagesOnDevice([{
               url_original: tab.url || '',
               url_normalized: norm,
-              title: tab.title || dom || 'Untitled',
+              title: capturedTitle || dom || 'Untitled',
               favicon_url: tab.favIconUrl || '',
               domain: dom
-            }]
-          });
+            }]);
           tab.isSavedInLibrary = true;
           savedLibraryUrlSet.add(norm);
-          renderTabs();
+          renderTabs(); updateSelectionUI();
         } catch (err) {
           console.error('Failed to save page to library', err);
+          showToast('Could not save this page. Try again.');
         }
       }
+      actionBtn.disabled = false;
+      actionBtn.style.opacity = '';
     });
 
-    // Clicking row toggles tab selection for delete/export
+    // Browsing is the default; selecting is an explicit mode.
     item.addEventListener('click', () => {
+      if (!selectionMode) { void activateOpenTab(tab.id); return; }
       if (!tab.id) return;
       const nowChecked = !selectedTabIds.has(tab.id);
       if (nowChecked) selectedTabIds.add(tab.id);
@@ -2312,27 +2355,9 @@ document.addEventListener('DOMContentLoaded', async () => {
       updateSelectionUI();
     });
 
-    // Double-clicking row switches directly to tab
-    item.addEventListener('dblclick', async (e) => {
-      e.stopPropagation();
-      if (tab.id !== undefined) {
-        try {
-          await chrome.tabs.update(tab.id, { active: true });
-          if (tab.windowId !== undefined) {
-            await chrome.windows.update(tab.windowId, { focused: true });
-          }
-          window.close();
-        } catch (err) {
-          console.error('Failed to switch tab on dblclick:', err);
-        }
-      }
-    });
-
-    item.appendChild(favicon);
-    item.appendChild(title);
-    if (tab.active) {
-      item.appendChild(createPokeballIndicator(tab));
-    }
+    item.appendChild(avatar);
+    item.appendChild(copy);
+    appendCurrentTabMarker(item, tab);
     item.appendChild(actionBtn);
 
     return item;
@@ -2341,12 +2366,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   function createTabItem(tab: ExtendedTab, isFlat = false): HTMLElement {
     const isChecked = tab.id ? selectedTabIds.has(tab.id) : false;
     const item = document.createElement('div');
+    item.dataset.tabId = String(tab.id ?? '');
     item.className = `tab-item ${isFlat ? 'flat' : ''} ${isChecked ? 'checked' : ''} ${tab.active ? 'active-tab' : ''}`;
 
-    const favicon = document.createElement('img');
-    favicon.className = 'tab-favicon';
-    favicon.src = tab.favIconUrl || 'public/icons/icon16.png';
-    favicon.onerror = () => { favicon.src = 'public/icons/icon16.png'; };
+    const favicon = createSiteIcon(tab.url || '', tab.favIconUrl);
 
     const title = document.createElement('div');
     title.className = 'tab-title';
@@ -2355,11 +2378,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     item.appendChild(favicon);
     item.appendChild(title);
-
-    if (tab.active) {
-      item.appendChild(createPokeballIndicator(tab));
-    }
-
+    appendCurrentTabMarker(item, tab);
     if (tab.isDuplicate) {
       const dupTag = document.createElement('span');
       dupTag.className = 'tab-dup-tag';
@@ -2378,28 +2397,13 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     // Clicking row toggles tab selection
     item.addEventListener('click', () => {
+      if (!selectionMode) { void activateOpenTab(tab.id); return; }
       if (!tab.id) return;
       const nowChecked = !selectedTabIds.has(tab.id);
       if (nowChecked) selectedTabIds.add(tab.id);
       else selectedTabIds.delete(tab.id);
       item.classList.toggle('checked', nowChecked);
       updateSelectionUI();
-    });
-
-    // Double-clicking row switches directly to tab
-    item.addEventListener('dblclick', async (e) => {
-      e.stopPropagation();
-      if (tab.id !== undefined) {
-        try {
-          await chrome.tabs.update(tab.id, { active: true });
-          if (tab.windowId !== undefined) {
-            await chrome.windows.update(tab.windowId, { focused: true });
-          }
-          window.close();
-        } catch (err) {
-          console.error('Failed to switch tab on dblclick:', err);
-        }
-      }
     });
 
     return item;
@@ -2409,35 +2413,10 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   // 4. Selection Button Handlers
   btnSelectAll.addEventListener('click', () => {
-    if (currentMode === 'group') {
-      if (currentGroupSubtab === 'saved') {
-        const openSaved = getOpenSavedGroups();
-        openSaved.forEach(g => {
-          selectedGroupKeys.add(`saved-${g.id}`);
-          const live = findOpenChromeGroupForSavedGroup(g);
-          const tabsToSelect = live ? live.tabs : (g.tabs || []);
-          tabsToSelect.forEach((t: any, idx: number) => {
-            selectedSavedTabKeys.add(`${g.id}:::${idx}:::${t.url || ''}`);
-            const liveTab = allOpenTabs.find(ot => ot.url === t.url || ot.url_normalized === t.url || ot.id === t.id);
-            if (liveTab?.id !== undefined) selectedTabIds.add(liveTab.id);
-          });
-        });
-      } else {
-        const unsaved = getUnsavedChromeGroups();
-        unsaved.forEach(u => {
-          selectedGroupKeys.add(`chrome-${u.group.id}`);
-          u.tabs.forEach(t => { if (t.id !== undefined) selectedTabIds.add(t.id); });
-        });
-
-        const ungroupedTabs = allOpenTabs.filter(t => t.groupId === undefined || t.groupId === chrome.tabGroups.TAB_GROUP_ID_NONE);
-        ungroupedTabs.forEach(t => { if (t.id !== undefined) selectedTabIds.add(t.id); });
-      }
-      document.querySelectorAll('.tab-item').forEach(item => item.classList.add('checked'));
-      document.querySelectorAll('.saved-group-card').forEach(c => c.classList.add('group-selected'));
-      document.querySelectorAll('.saved-group-header').forEach(h => h.classList.add('selected'));
-    } else {
-      allOpenTabs.forEach(t => t.id && selectedTabIds.add(t.id));
-      document.querySelectorAll('.tab-item').forEach(item => item.classList.add('checked'));
+    selectionMode = !selectionMode;
+    if (!selectionMode) {
+      selectedTabIds.clear(); selectedSavedTabKeys.clear(); selectedGroupKeys.clear();
+      container.querySelectorAll('.checked,.group-selected,.selected').forEach(row => row.classList.remove('checked', 'group-selected', 'selected'));
     }
     updateSelectionUI();
   });
@@ -2452,9 +2431,60 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateSelectionUI();
   });
 
+  btnSaveSelected?.addEventListener('click', async () => {
+    const tabs = allOpenTabs.filter(tab => tab.id && selectedTabIds.has(tab.id) && !tab.isSavedInLibrary && !tab.isNewTab&&/^https?:\/\//i.test(tab.url||''));
+    if (!tabs.length) return;
+    btnSaveSelected.disabled = true;
+    try {
+      const captured=await Promise.all(tabs.map(async tab => {
+        let domain = ''; try { domain = new URL(tab.url || '').hostname.replace(/^www\./, ''); } catch {}
+        return { url_original: tab.url || '', url_normalized: tab.normalizedUrl, title: await readableTabTitle(tab) || domain,
+          favicon_url: tab.favIconUrl || '', domain };
+      }));
+      await savePagesOnDevice(captured);
+      tabs.forEach(tab => { tab.isSavedInLibrary = true; savedLibraryUrlSet.add(tab.normalizedUrl); });
+      renderTabs();
+      showToast(`${tabs.length} tab${tabs.length === 1 ? '' : 's'} saved on this device. Uploading when connected.`, 'info');
+    } catch { showToast('Could not save these tabs. Please try again.', 'error'); }
+    updateSelectionUI();
+  });
+
+  function setActionLabel(target: HTMLElement, label: string, count: number) {
+    const badge = document.createElement('span');
+    badge.className = 'action-count';
+    badge.textContent = String(count);
+    target.replaceChildren(document.createTextNode(label + ' '), badge);
+  }
+
+  function updateRowAccessibility() {
+    container.querySelectorAll<HTMLElement>('.tab-item').forEach(row => {
+      row.tabIndex = 0;
+      row.setAttribute('role', 'button');
+      if (selectionMode) row.setAttribute('aria-pressed', String(row.classList.contains('checked')));
+      else row.removeAttribute('aria-pressed');
+      if (!row.dataset.keyboardReady) {
+        row.dataset.keyboardReady = 'true';
+        row.addEventListener('keydown', event => {
+          if (event.target !== row || (event.key !== ' ' && event.key !== 'Enter')) return;
+          event.preventDefault();
+          row.click();
+        });
+      }
+    });
+  }
+
   function updateSelectionUI() {
+    updateRowAccessibility();
     const totalSelected = selectedTabIds.size + selectedSavedTabKeys.size;
     selectedCountSpan.textContent = String(totalSelected);
+    const unsavedSelected = allOpenTabs.filter(tab => tab.id && selectedTabIds.has(tab.id) && !tab.isSavedInLibrary && !tab.isNewTab).length;
+    btnSaveSelected.disabled = unsavedSelected === 0;
+    btnSaveSelected.textContent = unsavedSelected ? `Save selected ${unsavedSelected}` : 'Save selected';
+    btnSelectAll.textContent = selectionMode ? 'Done' : 'Select';
+    btnSelectAll.setAttribute('aria-pressed', String(selectionMode));
+    btnDeselectAll.hidden = !selectionMode || totalSelected === 0;
+    document.getElementById('tab-counter-text')!.hidden = !selectionMode;
+    btnSaveSelected.hidden = currentMode !== 'library' || !selectionMode;
 
     if (currentMode === 'group') {
       if (selectRow) selectRow.style.display = 'flex';
@@ -2484,13 +2514,13 @@ document.addEventListener('DOMContentLoaded', async () => {
           if (btnCreateGroup) {
             btnCreateGroup.style.display = 'flex';
             if (createGroupText) {
-              createGroupText.textContent = totalSelected === 1 ? 'New Group (1)' : `New Group (${totalSelected})`;
+              setActionLabel(createGroupText, 'New group', totalSelected);
             }
           }
           if (btnDeleteTabs) {
             btnDeleteTabs.style.display = 'flex';
             if (deleteTabsText) {
-              deleteTabsText.textContent = totalSelected === 1 ? 'Delete (1)' : `Delete (${totalSelected})`;
+              setActionLabel(deleteTabsText, 'Close tabs', totalSelected);
             }
           }
         } else {
@@ -2528,13 +2558,13 @@ document.addEventListener('DOMContentLoaded', async () => {
       if (btnCreateGroup) {
         btnCreateGroup.style.display = 'flex';
         if (createGroupText) {
-          createGroupText.textContent = selectedTabIds.size === 1 ? 'New Group (1)' : `New Group (${selectedTabIds.size})`;
+          setActionLabel(createGroupText, 'New group', selectedTabIds.size);
         }
       }
       if (btnDeleteTabs) {
         btnDeleteTabs.style.display = 'flex';
         if (deleteTabsText) {
-          deleteTabsText.textContent = selectedTabIds.size === 1 ? 'Delete (1)' : `Delete (${selectedTabIds.size})`;
+          setActionLabel(deleteTabsText, 'Close tabs', selectedTabIds.size);
         }
       }
     } else {
@@ -2779,12 +2809,659 @@ document.addEventListener('DOMContentLoaded', async () => {
       } catch (err) {
         console.error('Export failed:', err);
         progressStatus.textContent = 'Export error!';
-        alert('Failed to export tabs. Ensure local backend is running at http://127.0.0.1:8742.');
+        alert('Failed to export tabs. Check your backend connection in workspace Settings.');
         progressContainer.style.display = 'none';
         if (btnExport) btnExport.disabled = false;
       }
     });
   }
+
+  // =========================================================================
+  // VIDEO COMPANION CONTROLLER
+  // =========================================================================
+  const companionTimeChip = document.getElementById('companion-time-chip') as HTMLSpanElement;
+  const companionNotesCount = document.getElementById('companion-notes-count') as HTMLSpanElement;
+  const companionVideoInfo = document.getElementById('companion-video-info') as HTMLDivElement;
+  const companionVideoName = document.getElementById('companion-video-name') as HTMLSpanElement;
+  const companionCommentInput = document.getElementById('companion-comment-input') as HTMLInputElement;
+  const btnAddCompanionComment = document.getElementById('btn-add-companion-comment') as HTMLButtonElement;
+  const btnToggleCompanionNotes = document.getElementById('btn-toggle-companion-notes') as HTMLButtonElement;
+  const companionNotesModal = document.getElementById('companion-notes-modal') as HTMLDivElement;
+  const companionNotesClose = document.getElementById('companion-notes-close') as HTMLSpanElement;
+  const modalNotesBadge = document.getElementById('modal-notes-badge') as HTMLSpanElement;
+  const btnCompanionFilterCurrent = document.getElementById('btn-companion-filter-current') as HTMLButtonElement;
+  const btnCompanionFilterAll = document.getElementById('btn-companion-filter-all') as HTMLButtonElement;
+  const btnCompanionExport = document.getElementById('btn-companion-export') as HTMLButtonElement;
+  const companionNotesContainer = document.getElementById('companion-notes-container') as HTMLDivElement;
+
+  // Attachment elements
+  const btnCompanionPlus = document.getElementById('btn-companion-plus') as HTMLButtonElement;
+  const companionAttachDropdown = document.getElementById('companion-attach-dropdown') as HTMLDivElement;
+  const btnAttachFile = document.getElementById('btn-attach-file') as HTMLButtonElement;
+  const companionFileInput = document.getElementById('companion-file-input') as HTMLInputElement;
+  const companionAttachmentsPreview = document.getElementById('companion-attachments-preview') as HTMLDivElement;
+
+  let pendingAttachments: NoteAttachment[] = [];
+
+  interface ActiveVideoState {
+    hasVideo: boolean;
+    currentTime: number;
+    duration: number;
+    isPlaying: boolean;
+    title: string;
+    url: string;
+    isYouTube: boolean;
+    videoId?: string | null;
+  }
+
+  let currentVideoState: ActiveVideoState | null = null;
+  let activeCompanionUrl = '';
+  let videoPollRevision = 0;
+  let allCompanionNotes: CompanionNote[] = [];
+  let companionFilter: 'current' | 'all' = 'all';
+  let renderedNotesSignature = '';
+
+  function formatVideoTimestamp(seconds: number): string {
+    if (isNaN(seconds) || seconds < 0) return '00:00';
+    const hrs = Math.floor(seconds / 3600);
+    const mins = Math.floor((seconds % 3600) / 60);
+    const secs = Math.floor(seconds % 60);
+    const pad = (n: number) => n.toString().padStart(2, '0');
+    if (hrs > 0) {
+      return `${hrs}:${pad(mins)}:${pad(secs)}`;
+    }
+    return `${pad(mins)}:${pad(secs)}`;
+  }
+
+  function companionTimeAgo(ms: number): string {
+    const diff = Date.now() - ms;
+    const s = Math.floor(diff / 1000);
+    if (s < 60) return 'just now';
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m ago`;
+    const h = Math.floor(m / 60);
+    if (h < 24) return `${h}h ago`;
+    const d = Math.floor(h / 24);
+    return `${d}d ago`;
+  }
+
+  function pageScriptExtractVideoDetails() {
+    const isYouTube = window.location.hostname.includes('youtube.com');
+    const videos = Array.from(document.querySelectorAll('video'));
+    let vid: HTMLVideoElement | null = null;
+    if (isYouTube) {
+      vid = document.querySelector('video.html5-main-video') as HTMLVideoElement;
+    }
+    if (!vid) {
+      vid = videos.find(v => !v.paused && !v.ended && v.currentTime > 0) || null;
+    }
+    if (!vid && videos.length > 0) {
+      vid = videos[0];
+    }
+
+    let title = document.title || '';
+    let videoId: string | null = null;
+    if (isYouTube) {
+      title = title.replace(/\s*-\s*YouTube$/, '').trim();
+      const ytH1 = document.querySelector('h1.ytd-watch-metadata yt-formatted-string, h1.title yt-formatted-string, #title h1 yt-formatted-string');
+      if (ytH1 && ytH1.textContent) {
+        title = ytH1.textContent.trim();
+      }
+      try {
+        const u = new URL(window.location.href);
+        videoId = u.searchParams.get('v');
+        if (!videoId && u.pathname.startsWith('/shorts/')) {
+          videoId = u.pathname.split('/')[2];
+        }
+      } catch {}
+    }
+
+    const cur = vid ? Math.floor(vid.currentTime) : 0;
+    const dur = vid && !isNaN(vid.duration) ? Math.floor(vid.duration) : 0;
+    const playing = vid ? !vid.paused && !vid.ended : false;
+
+    return {
+      hasVideo: !!vid || isYouTube,
+      currentTime: cur,
+      duration: dur,
+      isPlaying: playing,
+      title: title || document.title || 'Untitled Video',
+      url: window.location.href,
+      isYouTube,
+      videoId,
+    };
+  }
+
+  function pageScriptSeekVideo(targetSec: number) {
+    const isYouTube = window.location.hostname.includes('youtube.com');
+    let vid: HTMLVideoElement | null = null;
+    if (isYouTube) {
+      vid = document.querySelector('video.html5-main-video') as HTMLVideoElement;
+    }
+    if (!vid) {
+      const vids = Array.from(document.querySelectorAll('video'));
+      vid = vids.find(v => v.offsetWidth > 100 && v.offsetHeight > 100) || vids[0] || null;
+    }
+    if (vid) {
+      vid.currentTime = targetSec;
+      vid.play().catch(() => {});
+      return true;
+    }
+    return false;
+  }
+
+  async function pollActiveVideo() {
+    const revision = ++videoPollRevision;
+    try {
+      const [tab] = await chrome.tabs.query({ active: true, ...(selectedWindowId ? { windowId: selectedWindowId } : { currentWindow: true }) });
+      if (revision !== videoPollRevision) return;
+      activeCompanionUrl = tab?.url || '';
+      if (!tab?.id || !tab.url || !tab.url.startsWith('http')) {
+        currentVideoState = null;
+        updateCompanionUI(null);
+        return;
+      }
+
+      const results = await chrome.scripting.executeScript({
+        target: { tabId: tab.id },
+        func: pageScriptExtractVideoDetails,
+      });
+      if (revision !== videoPollRevision) return;
+
+      if (results && results[0]?.result) {
+        const state = results[0].result as ActiveVideoState;
+        currentVideoState = state;
+        updateCompanionUI(state);
+      } else {
+        currentVideoState = null;
+        updateCompanionUI(null);
+      }
+    } catch {
+      if (revision !== videoPollRevision) return;
+      currentVideoState = null;
+      updateCompanionUI(null);
+    }
+  }
+
+  function updateCompanionUI(state: ActiveVideoState | null) {
+    const currentTab = allOpenTabs.find(tab => tab.active);
+    const pageTitle = state?.title || currentTab?.title;
+    companionVideoName.textContent = pageTitle || 'Notes';
+    companionVideoName.title = pageTitle || 'Notes';
+    companionVideoInfo.style.display = 'block';
+    if (state && state.hasVideo) {
+      const timeStr = formatVideoTimestamp(state.currentTime);
+      companionTimeChip.textContent = timeStr;
+      companionTimeChip.title = `Current video time: ${timeStr} (click to re-sync)`;
+
+      if (document.activeElement !== companionCommentInput || !companionCommentInput.value) {
+        companionCommentInput.placeholder = `A note at ${timeStr}…`;
+      }
+    } else {
+      companionTimeChip.textContent = '--:--';
+      companionTimeChip.title = 'No active video detected (click to scan)';
+      companionVideoInfo.style.display = 'block';
+      if (document.activeElement !== companionCommentInput || !companionCommentInput.value) {
+        companionCommentInput.placeholder = 'A note or pasted image…';
+      }
+    }
+    updateCompanionBadges();
+    if (companionNotesModal.style.display === 'flex') renderCompanionNotesList();
+  }
+
+  function scopedCompanionNotes(scope: 'current' | 'all' = companionFilter) {
+    return notesForOpenTabs(allCompanionNotes, allOpenTabs, selectedWindowId,
+      scope === 'current' ? activeCompanionUrl : undefined);
+  }
+
+  function updateCompanionBadges() {
+    const total = scopedCompanionNotes('all').length;
+    companionNotesCount.textContent = String(total);
+    btnToggleCompanionNotes.title = `${total} notes for tabs open in this window`;
+    if (modalNotesBadge) {
+      modalNotesBadge.textContent = String(scopedCompanionNotes().length);
+    }
+  }
+
+  async function loadCompanionNotes() {
+    if (notesLoad) return notesLoad;
+    notesLoad = refreshCompanionNotes();
+    try { await notesLoad; } finally { notesLoad = null; }
+  }
+
+  async function removeLocalNotesForUrl(url: string) {
+    if (!companionReady) return;
+    allCompanionNotes = allCompanionNotes.filter(note => normalizeUrl(note.videoUrl) !== normalizeUrl(url));
+    await storage.set('companion_notes', allCompanionNotes);
+    updateCompanionBadges();
+    if (companionNotesModal.style.display === 'flex') renderCompanionNotesList();
+  }
+
+  async function refreshCompanionNotes(){
+    const stored=await storage.get<CompanionNote[]>('companion_notes')||[];
+    const existingJobs=await pendingSaves();
+    for(const note of stored.filter(note=>note.pendingSync&&!note.outboxManaged))if(!existingJobs.some(job=>job.payload.id===note.id)){await saveOnDevice('note',notePayload(note));note.outboxManaged=true;}
+    await storage.set('companion_notes',stored);
+    let remote=await cacheForBackend<any[]>('notes')||stored.filter(note=>!note.pendingSync).map(note=>({...notePayload(note),page_id:note.pageId}));
+    const merge=async()=>{
+      const merged=new Map(remote.map(note=>[note.id,parseNote(note)]));
+      for(const job of await pendingSaves()){
+        if(job.kind==='note')merged.set(job.payload.id,{...parseNote(job.payload),pendingSync:true,outboxManaged:true});
+        if(job.kind==='remove-note')merged.delete(job.payload.id);
+        if(job.kind==='remove-page')for(const [id,note]of merged)if(normalizeUrl(note.videoUrl)===normalizeUrl(job.payload.url))merged.delete(id);
+      }
+      allCompanionNotes=[...merged.values()].sort((a,b)=>b.createdAt-a.createdAt);await storage.set('companion_notes',allCompanionNotes);
+      updateCompanionBadges();if(companionNotesModal.style.display==='flex')renderCompanionNotesList();
+    };await merge();
+    try{const all:any[]=[];for(let offset=0;;offset+=1000){const batch=await apiClient.get<any[]>(`/api/companion?limit=1000&offset=${offset}`);all.push(...batch);if(batch.length<1000)break;}remote=all;await cacheForBackend('notes',all);await merge();}catch{}
+  }
+
+  function renderPendingAttachments() {
+    if (!companionAttachmentsPreview) return;
+    if (pendingAttachments.length === 0) {
+      companionAttachmentsPreview.style.display = 'none';
+      companionAttachmentsPreview.innerHTML = '';
+      return;
+    }
+    companionAttachmentsPreview.style.display = 'flex';
+    companionAttachmentsPreview.innerHTML = '';
+    pendingAttachments.forEach((att, idx) => {
+      const chip = document.createElement('div');
+      chip.className = 'companion-attachment-chip';
+      if (att.mime.startsWith('image/')) {
+        const img = document.createElement('img');
+        img.className = 'attachment-chip-thumb';
+        img.src = att.data;
+        chip.appendChild(img);
+      } else {
+        const icon = document.createElement('span');
+        icon.textContent = '📄';
+        chip.appendChild(icon);
+      }
+      const nameSpan = document.createElement('span');
+      nameSpan.className = 'attachment-chip-name';
+      nameSpan.textContent = att.name;
+      chip.appendChild(nameSpan);
+
+      const removeBtn = document.createElement('button');
+      removeBtn.className = 'attachment-chip-remove';
+      removeBtn.innerHTML = '✕';
+      removeBtn.title = 'Remove';
+      removeBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        pendingAttachments.splice(idx, 1);
+        renderPendingAttachments();
+      });
+      chip.appendChild(removeBtn);
+      companionAttachmentsPreview.appendChild(chip);
+    });
+  }
+
+  let companionSaving = false;
+  async function addCompanionComment() {
+    if (companionSaving) return;
+    const text = companionCommentInput.value.trim();
+    if (!text && pendingAttachments.length === 0) {
+      companionCommentInput.focus();
+      return;
+    }
+
+    companionSaving = true;
+    try {
+    const currentAtts=[...pendingAttachments];
+    const capturedVideo=currentVideoState?{...currentVideoState}:null;
+
+    const [tab] = await chrome.tabs.query({ active: true, ...(selectedWindowId ? {windowId:selectedWindowId} : {currentWindow:true}) });
+    const now = Date.now();
+    const vid = capturedVideo&&(!tab?.url||normalizeUrl(capturedVideo.url)===normalizeUrl(tab.url))?capturedVideo:null;
+    const targetSec = vid ? vid.currentTime : 0;
+    const formatted = formatVideoTimestamp(targetSec);
+    const baseVideoUrl = (vid && vid.url) ? vid.url : (tab?.url || '');
+    let timestampedUrl = baseVideoUrl;
+
+    if (vid && vid.isYouTube && vid.videoId) {
+      try {
+        const u = new URL(baseVideoUrl);
+        u.searchParams.set('t', `${Math.floor(targetSec)}s`);
+        timestampedUrl = u.toString();
+      } catch {}
+    } else if (targetSec > 0) {
+      timestampedUrl = `${baseVideoUrl}#t=${Math.floor(targetSec)}`;
+    }
+
+    let thumb = '';
+    if (vid && vid.isYouTube && vid.videoId) {
+      thumb = `https://img.youtube.com/vi/${vid.videoId}/mqdefault.jpg`;
+    } else if (tab?.favIconUrl) {
+      thumb = tab.favIconUrl;
+    }
+
+    const noteText = text || (pendingAttachments.length > 0 ? '📎 Attachment' : '');
+
+    const note: CompanionNote = {
+      id: `comp_${now}_${Math.random().toString(36).slice(2, 7)}`,
+      pendingSync: true,outboxManaged:true,
+      tabId: tab?.id,
+      videoUrl: baseVideoUrl,
+      timestampedUrl,
+      videoTitle: (vid && vid.title) ? vid.title : (tab?.title || 'Video Note'),
+      timestampSeconds: targetSec,
+      timestampFormatted: formatted,
+      comment: noteText,
+      thumbnailUrl: thumb,
+      attachments: currentAtts.length > 0 ? currentAtts : undefined,
+      createdAt: now,
+    };
+
+    await saveOnDevice('note',notePayload(note));
+    allCompanionNotes.unshift(note);await storage.set('companion_notes',allCompanionNotes).catch(()=>{});
+    const normalized=normalizeUrl(note.videoUrl);savedLibraryUrlSet.add(normalized);pendingUrls.add(normalized);
+    allOpenTabs.filter(tab=>tab.normalizedUrl===normalized).forEach(tab=>{tab.isSavedInLibrary=true;tab.pendingSave=true;});
+    if(companionCommentInput.value.trim()===text)companionCommentInput.value='';
+    pendingAttachments=pendingAttachments.filter(attachment=>!currentAtts.includes(attachment));
+    renderPendingAttachments();updateCompanionBadges();renderTabs();updateSelectionUI();
+    void persistPopupDraft();
+    showToast('Note saved on this device. Uploading when connected.','info',4500);
+
+    if (companionNotesModal.style.display !== 'none') {
+      renderCompanionNotesList();
+    }
+    } catch {
+      showToast('Could not save the note. Your draft is still here.', 'error');
+    } finally { companionSaving = false; }
+  }
+
+  function renderCompanionNotesList() {
+    const filtered = scopedCompanionNotes();
+    const signature = JSON.stringify([companionFilter, selectedWindowId, filtered.map(note => [note.id, note.comment, note.attachments])]);
+    if (signature === renderedNotesSignature) return;
+    renderedNotesSignature = signature;
+    companionNotesContainer.innerHTML = '';
+
+    modalNotesBadge.textContent = String(filtered.length);
+
+    if (filtered.length === 0) {
+      const empty = document.createElement('div');
+      empty.className = 'companion-empty-state';
+      empty.innerHTML = companionFilter === 'current'
+        ? '<span>No notes for this page yet.<br>Add a note or paste a snip in the composer.</span>'
+        : '<span>No notes for the tabs open in this window.<br>Your other saved notes are available in the workspace.</span>';
+      companionNotesContainer.appendChild(empty);
+      return;
+    }
+
+    filtered.forEach(note => {
+      const card = document.createElement('div');
+      card.className = 'companion-note-card';
+      card.dataset.noteId = note.id;
+
+      const topRow = document.createElement('div');
+      topRow.className = 'companion-note-top';
+
+      const timeBtn = document.createElement('button');
+      timeBtn.className = 'companion-timestamp-btn';
+      timeBtn.innerHTML = `<span>▶</span> <span>${note.timestampFormatted}</span>`;
+      timeBtn.title = `Jump to ${note.timestampFormatted} in video`;
+      timeBtn.addEventListener('click', async () => {
+        await jumpToVideoTimestamp(note);
+      });
+
+      const actions = document.createElement('div');
+      actions.className = 'companion-note-actions';
+
+      const copyBtn = document.createElement('button');
+      copyBtn.className = 'companion-note-action-btn';
+      copyBtn.innerHTML = '📋';
+      copyBtn.title = 'Copy note';
+      copyBtn.addEventListener('click', async () => {
+        try {
+          await copyPopupText(`[${note.timestampFormatted}] ${note.comment} (${note.timestampedUrl})`);
+          showToast('Note copied to clipboard!', 'success');
+        } catch { showToast('Clipboard unavailable. Try copying again.', 'error'); }
+      });
+
+      const delBtn = document.createElement('button');
+      delBtn.className = 'companion-note-action-btn delete-btn';
+      delBtn.innerHTML = '✕';
+      delBtn.title = 'Delete note';
+      delBtn.addEventListener('click', async () => {
+        try {
+          await saveOnDevice('remove-note',{id:note.id});
+        } catch { showToast('Could not remove this note. Try again.', 'error'); return; }
+        allCompanionNotes = allCompanionNotes.filter(n => n.id !== note.id);
+        await storage.set('companion_notes', allCompanionNotes);
+        updateCompanionBadges();
+        renderCompanionNotesList();
+        showToast(note.pendingSync ? 'Local draft removed' : 'Note moved to Recycle bin for 5 days', 'info');
+      });
+
+      actions.appendChild(copyBtn);
+      actions.appendChild(delBtn);
+
+      topRow.appendChild(timeBtn);
+      topRow.appendChild(actions);
+
+      const commentEl = document.createElement('div');
+      commentEl.className = 'companion-note-comment';
+      commentEl.textContent = note.comment;
+
+      // Render attachments if any
+      let attWrap: HTMLElement | null = null;
+      if (note.attachments && note.attachments.length > 0) {
+        attWrap = document.createElement('div');
+        attWrap.className = 'companion-note-attachments';
+        note.attachments.forEach(att => {
+          if (att.mime.startsWith('image/')) {
+            const img = document.createElement('img');
+            img.className = 'note-attachment-thumb';
+            img.src = att.data;
+            img.title = att.name;
+            img.addEventListener('click', () => {
+              const w = window.open('');
+              w?.document.write(`<img src="${att.data}" style="max-width:100%" />`);
+            });
+            attWrap?.appendChild(img);
+          } else {
+            const link = document.createElement('a');
+            link.className = 'note-attachment-item';
+            link.href = att.data;
+            link.download = att.name;
+            link.innerHTML = `<span>📄</span> <span>${att.name}</span>`;
+            attWrap?.appendChild(link);
+          }
+        });
+      }
+
+      const footer = document.createElement('div');
+      footer.className = 'companion-note-footer';
+
+      const vidInfo = document.createElement('div');
+      vidInfo.className = 'companion-note-video-info';
+      if (note.thumbnailUrl) {
+        const img = document.createElement('img');
+        img.className = 'companion-note-thumb';
+        img.src = note.thumbnailUrl;
+        img.alt = '';
+        vidInfo.appendChild(img);
+      }
+      const titleSpan = document.createElement('span');
+      titleSpan.textContent = note.videoTitle;
+      titleSpan.title = note.videoTitle;
+      vidInfo.appendChild(titleSpan);
+
+      const dateSpan = document.createElement('span');
+      dateSpan.textContent = companionTimeAgo(note.createdAt);
+
+      footer.appendChild(vidInfo);
+      footer.appendChild(dateSpan);
+
+      card.appendChild(topRow);
+      card.appendChild(commentEl);
+      if (attWrap) card.appendChild(attWrap);
+      card.appendChild(footer);
+
+      companionNotesContainer.appendChild(card);
+    });
+  }
+
+  async function jumpToVideoTimestamp(note: CompanionNote) {
+    try {
+      const tabs = await chrome.tabs.query(selectedWindowId ? { windowId: selectedWindowId } : { currentWindow: true });
+      const noteBase = normalizeUrl(note.videoUrl);
+      const matchingTab = tabs.find(t => t.url && normalizeUrl(t.url) === noteBase);
+
+      if (matchingTab && matchingTab.id) {
+        await chrome.tabs.update(matchingTab.id, { active: true });
+        if (matchingTab.windowId) {
+          await chrome.windows.update(matchingTab.windowId, { focused: true });
+        }
+        await chrome.scripting.executeScript({
+          target: { tabId: matchingTab.id },
+          func: pageScriptSeekVideo,
+          args: [note.timestampSeconds],
+        });
+        showToast(`⏩ Jumped to ${note.timestampFormatted}!`, 'success');
+      } else {
+        await chrome.tabs.create({ url: note.timestampedUrl, active: true });
+        showToast(`🎬 Opening video at ${note.timestampFormatted}`, 'info');
+      }
+    } catch (err) {
+      console.error('Failed to seek video:', err);
+      await chrome.tabs.create({ url: note.timestampedUrl, active: true });
+    }
+  }
+
+  let popupDraftKey='',draftRevision=0;
+  async function persistPopupDraft(){
+    draftRevision++;
+    if(popupDraftKey)await deviceSet('drafts',popupDraftKey,{text:companionCommentInput.value,attachments:pendingAttachments});
+  }
+  companionCommentInput.addEventListener('input',()=>void persistPopupDraft());
+  void getBackendConnection().then(async connection=>{
+    const [tab]=await chrome.tabs.query({active:true,...(selectedWindowId?{windowId:selectedWindowId}:{currentWindow:true})});
+    popupDraftKey=JSON.stringify([connection.url,'popup-note',normalizeUrl(tab?.url||'')]);
+    const revision=draftRevision,saved=await deviceGet<{text:string;attachments:NoteAttachment[]}>('drafts',popupDraftKey);
+    if(saved&&revision===draftRevision&&!companionCommentInput.value){companionCommentInput.value=saved.text;pendingAttachments=saved.attachments;renderPendingAttachments();}
+  });
+
+  // Event Listeners for Companion
+  btnAddCompanionComment?.addEventListener('click', addCompanionComment);
+  companionCommentInput?.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+      e.preventDefault();
+      addCompanionComment();
+    }
+  });
+
+  // Attachments (+) Dropdown & Uploads
+  btnCompanionPlus?.addEventListener('click', (e) => {
+    e.stopPropagation();
+    const isOpen = companionAttachDropdown.style.display === 'flex';
+    companionAttachDropdown.style.display = isOpen ? 'none' : 'flex';
+  });
+
+  document.addEventListener('click', (e) => {
+    if (companionAttachDropdown && !companionAttachDropdown.contains(e.target as Node) && e.target !== btnCompanionPlus) {
+      companionAttachDropdown.style.display = 'none';
+    }
+  });
+
+  btnAttachFile?.addEventListener('click', () => {
+    companionAttachDropdown.style.display = 'none';
+    companionFileInput?.click();
+  });
+
+  function attachNoteFiles(files: File[]) {
+    files.forEach(file => {
+      const reader = new FileReader();
+      reader.onload = () => {
+        if (typeof reader.result === 'string') {
+          pendingAttachments.push({
+            name: file.name || 'pasted-image.png',
+            mime: file.type || 'application/octet-stream',
+            data: reader.result,
+            size: file.size
+          });
+          renderPendingAttachments();
+        }
+      };
+      reader.onerror = () => showToast('Could not attach this file. Please try again.', 'error');
+      reader.readAsDataURL(file);
+    });
+  }
+
+  companionFileInput?.addEventListener('change', () => {
+    const files = companionFileInput.files;
+    if (!files || files.length === 0) return;
+    attachNoteFiles(Array.from(files));
+    companionFileInput.value = '';
+  });
+
+  // A normal paste event supplies clipboard images without reading the clipboard
+  // or asking for permissions. Leave text paste untouched, including mixed clips.
+  companionCommentInput?.addEventListener('paste', (event: ClipboardEvent) => {
+    const imageFiles = Array.from(event.clipboardData?.items || [])
+      .filter(item => item.kind === 'file' && item.type.startsWith('image/'))
+      .map(item => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (imageFiles.length) attachNoteFiles(imageFiles);
+  });
+
+  companionTimeChip?.addEventListener('click', () => {
+    pollActiveVideo();
+    showToast('⏱️ Refreshed video timestamp', 'info');
+  });
+
+  btnToggleCompanionNotes?.addEventListener('click', () => {
+    renderCompanionNotesList();
+    companionNotesModal.style.display = 'flex';
+  });
+
+  companionNotesClose?.addEventListener('click', () => {
+    companionNotesModal.style.display = 'none';
+  });
+
+  btnCompanionFilterCurrent?.addEventListener('click', () => {
+    companionFilter = 'current';
+    btnCompanionFilterCurrent.classList.add('active');
+    btnCompanionFilterAll.classList.remove('active');
+    renderCompanionNotesList();
+  });
+
+  btnCompanionFilterAll?.addEventListener('click', () => {
+    companionFilter = 'all';
+    btnCompanionFilterAll.classList.add('active');
+    btnCompanionFilterCurrent.classList.remove('active');
+    renderCompanionNotesList();
+  });
+
+  btnCompanionExport?.addEventListener('click', async () => {
+    const notesToExport = scopedCompanionNotes();
+    if (notesToExport.length === 0) {
+      showToast('No notes to copy', 'info');
+      return;
+    }
+    const title = notesToExport[0]?.videoTitle || 'Companion Notes';
+    const lines = [`# Notes: ${companionFilter === 'current' ? title : 'Open tabs in this window'}\n`];
+    notesToExport.forEach(n => {
+      lines.push(`- **[${n.timestampFormatted}](${n.timestampedUrl})**: ${n.comment}`);
+    });
+    try {
+      await copyPopupText(lines.join('\n'));
+      showToast('📋 Copied notes as Markdown to clipboard!', 'success');
+    } catch { showToast('Clipboard unavailable. Try copying again.', 'error'); }
+  });
+
+  // Initial load & poll for video companion
+  companionReady = true;
+  startSaveSync();
+  void refreshSavedStatus();
+  const stopSync=onDeviceSync(()=>{void refreshSavedStatus();void loadCompanionNotes();void loadSavedGroups();});
+  window.addEventListener('unload',stopSync);
+  loadCompanionNotes();
+  pollActiveVideo();
+  const videoPollInterval = setInterval(pollActiveVideo, 2500);
+  window.addEventListener('unload', () => clearInterval(videoPollInterval));
 
   // Keep popup/sidepanel UI in sync if tabs or groups change in the browser
   let refreshDebounceTimer: any = null;

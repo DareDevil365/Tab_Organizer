@@ -11,6 +11,22 @@ from app.services.embedder import generate_embedding, compute_cosine_similarity
 from app.services.graph_service import build_knowledge_graph
 
 
+def test_fallback_embeddings_are_stable_across_process_hash_seeds():
+    import os
+    import subprocess
+    import sys
+    code = (
+        "import hashlib; from app.services.embedder import FallbackEmbedder; "
+        "vector = FallbackEmbedder().encode('Transformers attention embeddings'); "
+        "print(hashlib.sha256(vector.tobytes()).hexdigest())"
+    )
+    signatures = [subprocess.check_output(
+        [sys.executable, '-c', code],
+        env={**os.environ, 'PYTHONHASHSEED': seed}, text=True
+    ).strip() for seed in ('1', '999')]
+    assert signatures[0] == signatures[1]
+
+
 @pytest.mark.asyncio
 async def test_embedder_and_similarity():
     v1 = generate_embedding("machine learning artificial intelligence deep neural networks")
@@ -57,13 +73,15 @@ async def test_knowledge_graph_generation():
         await session.commit()
 
         graph = await build_knowledge_graph(session)
+        assert graph['schema'] == 'connections-v1'
         assert graph["total_nodes"] > 0
         assert graph["total_edges"] > 0
 
-        # Both pages should connect to github.com domain node and programming topic node
+        # Shared subject ancestry replaces platform/domain hubs.
         node_types = {n["type"] for n in graph["nodes"]}
         assert "page" in node_types
-        assert "domain" in node_types
+        assert "domain" not in node_types
         assert "topic" in node_types
+        assert all('parent_id' in n for n in graph['nodes'])
 
     await test_engine.dispose()

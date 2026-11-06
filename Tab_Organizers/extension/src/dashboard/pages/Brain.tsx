@@ -71,7 +71,7 @@ export const Brain: React.FC = () => {
         {
           id: String(Date.now() + 1),
           sender: 'assistant',
-          text: "⚠️ **Failed to query the Brain assistant.**\n\nPlease ensure the backend server is running at `http://127.0.0.1:8742` and your Gemini API keys are active in `.env`."
+          text: 'Could not reach the assistant. Check the backend connection in Settings and try again.'
         }
       ]);
     } finally {

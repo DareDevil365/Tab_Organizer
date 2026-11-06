@@ -1,17 +1,29 @@
 import logging
+import hashlib
 import numpy as np
+from app.config import settings
 from typing import List, Optional
 
 logger = logging.getLogger(__name__)
 
 _model = None
+_loaded_provider = None
 MODEL_NAME = "all-MiniLM-L6-v2"
 
 
 def get_embedding_model():
     """Lazy loader for sentence-transformers model to optimize startup time."""
-    global _model
+    global _model, _loaded_provider
+    if _loaded_provider != settings.EMBEDDING_PROVIDER:
+        _model=None
+        _loaded_provider=settings.EMBEDDING_PROVIDER
     if _model is None:
+        if settings.EMBEDDING_PROVIDER == 'cloudflare':
+            from app.services.cloud_embeddings import CloudflareEmbedder
+            _model=CloudflareEmbedder()
+            return _model
+        if settings.EMBEDDING_PROVIDER != 'local':
+            raise ValueError('Unknown embedding provider')
         try:
             from sentence_transformers import SentenceTransformer
             logger.info(f"Loading local embedding model: {MODEL_NAME} on CPU...")
@@ -22,10 +34,17 @@ def get_embedding_model():
     return _model
 
 
+def embedding_identity():
+    model=get_embedding_model()
+    if isinstance(model,FallbackEmbedder):return 'hash-sha256-v1'
+    return getattr(model,'key',MODEL_NAME)
+
+
 class FallbackEmbedder:
     """
     Lightweight fallback embedder if sentence-transformers is not yet installed.
-    Uses n-gram character hashing with tf-idf scaling to produce dense 384-d vectors.
+    Uses stable word hashing with position weighting to produce 384-d vectors.
+    Digest-based buckets keep persisted vectors comparable across app restarts.
     """
     def encode(self, texts, show_progress_bar=False, normalize_embeddings=True):
         is_single = isinstance(texts, str)
@@ -36,7 +55,8 @@ class FallbackEmbedder:
             v = np.zeros(384, dtype=np.float32)
             words = (t or "").lower().split()
             for idx, word in enumerate(words):
-                h = abs(hash(word)) % 384
+                digest = hashlib.sha256(word.encode('utf-8')).digest()
+                h = int.from_bytes(digest[:8], 'big') % 384
                 v[h] += 1.0 / (idx + 1)
             norm = np.linalg.norm(v)
             if norm > 0:

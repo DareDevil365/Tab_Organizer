@@ -4,13 +4,23 @@ from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
-from app.services.brain_service import ask_brain, generate_learning_plan, ensure_page_embeddings
+from app.services.brain_service import (
+    ask_brain, 
+    ask_page_brain, 
+    generate_learning_plan, 
+    ensure_page_embeddings
+)
 
 router = APIRouter(prefix="/api/brain", tags=["brain"])
 
 
 class AskBrainRequest(BaseModel):
     question: str
+
+
+class PageChatRequest(BaseModel):
+    page_id: int
+    message: str
 
 
 class PlanRequest(BaseModel):
@@ -23,6 +33,19 @@ async def ask_brain_endpoint(payload: AskBrainRequest, db: AsyncSession = Depend
     if not payload.question or not payload.question.strip():
         raise HTTPException(status_code=400, detail="Question cannot be empty")
     return await ask_brain(payload.question.strip(), db)
+
+
+@router.post("/page-chat")
+async def page_chat_endpoint(payload: PageChatRequest, db: AsyncSession = Depends(get_db)):
+    """In-context copilot endpoint chatting about a specific saved tab/page without manual page re-prompting."""
+    if not payload.message or not payload.message.strip():
+        raise HTTPException(status_code=400, detail="Message cannot be empty")
+    try:
+        return await ask_page_brain(payload.page_id, payload.message.strip(), db)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/plan")

@@ -1,34 +1,55 @@
 import React, { useState, useEffect } from 'react';
 import { PageCard } from '../components/PageCard';
 import { apiClient } from '../../lib/api-client';
+import { PageData } from '../../types';
+import { LibraryFilters, emptyFilters, pageTopics } from '../../lib/page-filters';
+import { VirtualPageGrid } from '../components/VirtualPageGrid';
+import { SessionRecovery } from '../components/SessionRecovery';
 
 interface LibraryProps {
+  view?: 'library' | 'sessions';
+  toolbarActions?: React.ReactNode;
+  selectionMode?: boolean;
+  selectedIds?: Set<number>;
+  onToggleSelection?: (id: number) => void;
   searchQuery: string;
   setSearchQuery: (q: string) => void;
-  selectedFilter: string;
-  setSelectedFilter: (f: string) => void;
-  filterType: 'all' | 'domain' | 'topic' | 'important' | 'urgent';
-  setFilterType: (t: 'all' | 'domain' | 'topic' | 'important' | 'urgent') => void;
+  filters: LibraryFilters;
+  setFilters: React.Dispatch<React.SetStateAction<LibraryFilters>>;
   pages: any[];
+  filteredPages: any[];
+  searchStatus: { pending: boolean; error: boolean; interpreted: string; mode: string };
   loading: boolean;
   onRefresh: () => void;
   onToggleImportant: (pageId: number, currentVal: boolean) => void;
   onToggleUrgent: (pageId: number, currentVal: boolean) => void;
   onDelete: (pageId: number) => void;
+  onSelectPage?: (pageId: number) => void;
+  onCompletionUpdated?: (page: PageData) => void;
 }
 
 export const Library: React.FC<LibraryProps> = ({
+  view = 'library',
+  toolbarActions,
+  selectionMode,
+  selectedIds,
+  onToggleSelection,
   searchQuery,
-  selectedFilter,
-  setSelectedFilter,
-  filterType,
-  setFilterType,
+  setSearchQuery,
+  onRefresh,
+  filters,
+  setFilters,
   pages,
+  filteredPages,
+  searchStatus,
   loading,
   onToggleImportant,
   onToggleUrgent,
   onDelete,
+  onSelectPage,
+  onCompletionUpdated,
 }) => {
+  const [grouped, setGrouped] = useState(() => localStorage.getItem('karlx-library-grouped') === 'true');
   const [browserSessions, setBrowserSessions] = useState<any[]>([]);
   const [reincarnatingId, setReincarnatingId] = useState<string | null>(null);
 
@@ -52,6 +73,7 @@ export const Library: React.FC<LibraryProps> = ({
   }
 
   const handleReincarnate = (session: any) => {
+    if (!chrome?.runtime?.sendMessage) return;
     setReincarnatingId(session.session_id);
     chrome.runtime.sendMessage({
       type: 'REINCARNATE_BROWSER_SESSION',
@@ -66,29 +88,30 @@ export const Library: React.FC<LibraryProps> = ({
 
   const handleDismiss = (sessionId: string) => {
     setBrowserSessions(prev => prev.filter(s => s.session_id !== sessionId));
-    chrome.runtime.sendMessage({ type: 'DELETE_BROWSER_SESSION', sessionId });
+    if (chrome?.runtime?.sendMessage) {
+      chrome.runtime.sendMessage({ type: 'DELETE_BROWSER_SESSION', sessionId });
+    } else {
+      apiClient.delete(`/api/windows/browser-sessions/${sessionId}`).catch(loadBrowserSessions);
+    }
   };
+
   // Derive domains and topics
   const domainCounts = new Map<string, number>();
   const topicCounts = new Map<string, number>();
-  const ignored = new Set(['general', 'other', 'uncategorized', 'none', 'unknown', '']);
 
-  let importantCount = 0;
-  let urgentCount = 0;
+
 
   pages.forEach(p => {
-    if (p.is_important) importantCount++;
-    if (p.is_urgent) urgentCount++;
+
 
     const domain = p.domain || (p.url_original ? (() => {
       try { return new URL(p.url_original).hostname.replace(/^www\./, ''); } catch { return ''; }
     })() : '');
     if (domain) domainCounts.set(domain, (domainCounts.get(domain) || 0) + 1);
 
-    const topic = (p.topic || '').trim();
-    if (topic && !ignored.has(topic.toLowerCase())) {
+    pageTopics(p).forEach(topic => {
       topicCounts.set(topic, (topicCounts.get(topic) || 0) + 1);
-    }
+    });
   });
 
   const topTopics = Array.from(topicCounts.entries())
@@ -97,236 +120,63 @@ export const Library: React.FC<LibraryProps> = ({
 
   const topDomains = Array.from(domainCounts.entries())
     .sort((a, b) => b[1] - a[1])
-    .slice(0, 6)
-    .map(([d]) => d);
+    .map(([domain, count]) => ({ domain, count }));
 
-  // Filter pages
-  const filtered = pages.filter(p => {
-    if (filterType === 'important') {
-      if (!p.is_important) return false;
-    } else if (filterType === 'urgent') {
-      if (!p.is_urgent) return false;
-    } else if (filterType === 'domain') {
-      const domain = p.domain || (p.url_original ? (() => {
-        try { return new URL(p.url_original).hostname.replace(/^www\./, ''); } catch { return ''; }
-      })() : '');
-      if (domain.toLowerCase() !== selectedFilter.toLowerCase()) return false;
-    } else if (filterType === 'topic') {
-      const topic = (p.topic || '').trim().toLowerCase();
-      if (topic !== selectedFilter.toLowerCase()) return false;
-    }
-
-    if (searchQuery.trim()) {
-      const q = searchQuery.toLowerCase();
-      return (
-        (p.title || '').toLowerCase().includes(q) ||
-        (p.domain || '').toLowerCase().includes(q) ||
-        (p.description || '').toLowerCase().includes(q) ||
-        (p.topic || '').toLowerCase().includes(q)
-      );
-    }
-
-    return true;
-  });
+  // Filtering
+  const filtered = filteredPages;
 
   return (
     <>
-      {/* ✦ Reincarnate Hub (Last 2 Sessions Cache) */}
-      {browserSessions.length > 0 && (
-        <div
-          id="reincarnate-hub"
-          style={{
-            background: 'linear-gradient(135deg, rgba(124, 92, 255, 0.12), rgba(16, 185, 129, 0.08))',
-            border: '1px solid rgba(124, 92, 255, 0.35)',
-            borderRadius: 14,
-            padding: '16px 20px',
-            marginBottom: 20,
-            boxShadow: '0 4px 20px rgba(0, 0, 0, 0.2)'
-          }}
-        >
-          <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12 }}>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <span style={{ fontSize: 16 }}>✨</span>
-              <span style={{ fontSize: 15, fontWeight: 700, color: 'var(--text-primary)' }}>
-                Reincarnate Station (Last {browserSessions.length} Session{browserSessions.length > 1 ? 's' : ''})
-              </span>
-              <span style={{ fontSize: 11, background: 'rgba(124, 92, 255, 0.2)', color: '#c4b5fd', padding: '2px 8px', borderRadius: 999, fontWeight: 600 }}>
-                Cache Memory
-              </span>
-            </div>
-            <span style={{ fontSize: 12, color: 'var(--text-tertiary)' }}>
-              Restore full multi-window sessions with tabs & groups
-            </span>
-          </div>
+      {browserSessions.length > 0 && <SessionRecovery sessions={browserSessions} restoring={reincarnatingId} onRestore={handleReincarnate} onDismiss={handleDismiss}/>}
 
-          <div style={{ display: 'grid', gridTemplateColumns: browserSessions.length > 1 ? '1fr 1fr' : '1fr', gap: 12 }}>
-            {browserSessions.map((session, idx) => (
-              <div
-                key={session.session_id || idx}
-                style={{
-                  background: 'var(--surface)',
-                  border: '1px solid var(--border)',
-                  borderRadius: 10,
-                  padding: '14px 16px',
-                  display: 'flex',
-                  flexDirection: 'column',
-                  justifyContent: 'space-between',
-                  gap: 10
-                }}
-              >
-                <div>
-                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 6 }}>
-                    <span style={{ fontSize: 13.5, fontWeight: 700, color: 'var(--text-primary)' }}>
-                      🪟 {session.window_count || session.windows?.length || 1} Window{(session.window_count || session.windows?.length || 1) > 1 ? 's' : ''} · {session.total_tab_count || 0} Tabs
-                    </span>
-                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                      <span style={{ fontSize: 11, color: 'var(--text-tertiary)', background: 'var(--bg)', padding: '2px 6px', borderRadius: 4 }}>
-                        {session.closed_ago || 'Recent'}
-                      </span>
-                      <button
-                        onClick={() => handleDismiss(session.session_id)}
-                        title="Dismiss this session snapshot"
-                        style={{
-                          background: 'transparent',
-                          border: 'none',
-                          color: 'var(--text-tertiary)',
-                          cursor: 'pointer',
-                          fontSize: 13,
-                          padding: '0 2px'
-                        }}
-                      >
-                        ✕
-                      </button>
-                    </div>
-                  </div>
-
-                  <div style={{ fontSize: 12, color: 'var(--text-secondary)', marginBottom: 8, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
-                    {session.title_preview || 'Saved browser session'}
-                  </div>
-
-                  {/* Window & Group Breakdown Tags */}
-                  <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-                    {session.windows?.map((w: any, wIdx: number) => (
-                      <span
-                        key={wIdx}
-                        style={{
-                          fontSize: 10.5,
-                          background: 'rgba(255, 255, 255, 0.05)',
-                          border: '1px solid var(--border)',
-                          borderRadius: 4,
-                          padding: '1px 5px',
-                          color: 'var(--text-tertiary)'
-                        }}
-                      >
-                        Win {wIdx + 1}: {w.tabs?.length || 0} tabs
-                      </span>
-                    ))}
-                  </div>
-                </div>
-
-                <button
-                  onClick={() => handleReincarnate(session)}
-                  disabled={reincarnatingId === session.session_id}
-                  style={{
-                    background: 'linear-gradient(135deg, #7c5cff, #a78bfa)',
-                    color: '#ffffff',
-                    border: 'none',
-                    borderRadius: 8,
-                    padding: '8px 14px',
-                    fontSize: 12.5,
-                    fontWeight: 700,
-                    cursor: 'pointer',
-                    display: 'flex',
-                    alignItems: 'center',
-                    justifyContent: 'center',
-                    gap: 6,
-                    transition: 'all 0.15s ease'
-                  }}
-                >
-                  <span>✦</span>
-                  <span>{reincarnatingId === session.session_id ? 'Reincarnating...' : 'Reincarnate Session'}</span>
-                </button>
-              </div>
-            ))}
-          </div>
+      {view === 'sessions' && browserSessions.length === 0 && (
+        <div className="empty-state sessions-empty-state">
+          <h2>No saved sessions yet</h2>
+          <p>Recently closed browser windows will appear here so you can restore their tabs and groups. Open this workspace from the extension to recover a session.</p>
+          <button className="pill" onClick={loadBrowserSessions}>Check for sessions</button>
         </div>
       )}
-
-      {/* Category & Topic Pills */}
-      <div className="pill-row" id="pill-row">
-        <button
-          className={`pill ${filterType === 'all' ? 'active' : ''}`}
-          onClick={() => {
-            setSelectedFilter('All');
-            setFilterType('all');
-          }}
-        >
-          All ({pages.length})
-        </button>
-
-        <button
-          className={`pill pill-important ${filterType === 'important' ? 'active' : ''}`}
-          onClick={() => {
-            setSelectedFilter('Important');
-            setFilterType('important');
-          }}
-        >
-          ★ Important ({importantCount})
-        </button>
-
-        <button
-          className={`pill pill-urgent ${filterType === 'urgent' ? 'active' : ''}`}
-          onClick={() => {
-            setSelectedFilter('Urgent');
-            setFilterType('urgent');
-          }}
-        >
-          🔥 Urgent ({urgentCount})
-        </button>
-
-        {/* Priority: Topic Tag Pills */}
-        {topTopics.map(({ topic, count }) => (
-          <button
-            key={topic}
-            className={`pill pill-topic ${selectedFilter.toLowerCase() === topic.toLowerCase() && filterType === 'topic' ? 'active' : ''}`}
+      {view === 'library' && <>
+      <div className="library-toolbar">
+        <div className="library-toolbar-filters pill-row" id="chips" aria-label="Filter library">
+          {(['all','unseen','completed'] as const).map(status=><button key={status} className={`pill ${filters.status===status?'active':''}`} aria-pressed={filters.status===status} onClick={()=>setFilters(current=>({...current,status}))}>{status==='all'?'Everything':status==='unseen'?'Unseen':'Completed'}</button>)}
+          {([['hasNotes','Has notes'],['important','Important'],['urgent','Urgent']] as const).map(([key,label])=><button key={key} className={`pill ${filters[key]?'active':''}`} aria-pressed={filters[key]} onClick={()=>setFilters(current=>({...current,[key]:!current[key]}))}>{label}</button>)}
+        </div>
+        <div className="library-toolbar-actions">
+          <label className="library-topic-filter"><span className="sr-only">Filter by topic</span><select aria-label="Filter by topic" value={filters.topic} onChange={event=>setFilters(current=>({...current,topic:event.target.value}))}><option value="">All topics</option>{topTopics.map(({topic,count})=><option key={topic} value={topic}>{topic} ({count})</option>)}</select></label>
+          <label className="library-domain-filter"><select aria-label="Filter by website" value={filters.domain} onChange={event=>setFilters(current=>({...current,domain:event.target.value}))}><option value="">All websites</option>{topDomains.map(({domain,count})=><option key={domain} value={domain}>{domain} ({count})</option>)}</select></label>
+          <button className="pill library-view-toggle" aria-pressed={grouped}
+            title={grouped ? 'Show all resources together' : 'Arrange resources by topic'}
             onClick={() => {
-              setSelectedFilter(topic);
-              setFilterType('topic');
-            }}
-          >
-            #{topic} ({count})
+              const next = !grouped; setGrouped(next); localStorage.setItem('karlx-library-grouped', String(next));
+            }}>
+            <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="m12 3 9 5-9 5-9-5 9-5Z"/><path d="m3 12 9 5 9-5M3 16l9 5 9-5"/></svg>
+            {grouped ? 'Grouped' : 'Group'}
           </button>
-        ))}
-
-        {/* Secondary: Top Domains */}
-        {topDomains.map(domain => (
-          <button
-            key={domain}
-            className={`pill ${selectedFilter.toLowerCase() === domain.toLowerCase() && filterType === 'domain' ? 'active' : ''}`}
-            onClick={() => {
-              setSelectedFilter(domain);
-              setFilterType('domain');
-            }}
-          >
-            {domain}
-          </button>
-        ))}
+          {toolbarActions}
+        </div>
       </div>
 
-      {/* Cards Grid */}
-      <div className="grid" id="grid">
+      {(filters.topic||filters.domain||filters.status!=='all'||filters.hasNotes||filters.important||filters.urgent)&&<div className="active-filters" aria-label="Active filters">{Object.entries(filters).filter(([key,value])=>value&&!(key==='status'&&value==='all')).map(([key,value])=><button className="pill" key={key} onClick={()=>setFilters(current=>({...current,[key]:emptyFilters[key as keyof LibraryFilters]}))}>{key==='hasNotes'?'Has notes':value===true?key:String(value)} ×</button>)}<button className="pill" onClick={()=>setFilters({...emptyFilters})}>Clear filters</button></div>}
+      {/* Grid */}
+      {searchQuery.trim() && <div className="library-search-status" role="status">
+        <span>{searchStatus.pending ? 'Finding related resources…' : searchStatus.error ? 'Related search unavailable. Text matches are ranked first.' : searchStatus.mode === 'semantic' ? 'Ranked by meaning and text relevance' : 'Ranked by related topics and text'}</span>
+        {searchStatus.interpreted && searchStatus.interpreted.toLowerCase() !== searchQuery.trim().toLowerCase() && <span>Interpreted as “{searchStatus.interpreted}”</span>}
+        <small>All {filtered.length} resources in this view remain available.</small>
+      </div>}
+      <div className="library-content" id="grid">
         {loading ? (
           <div className="empty-state">
-            <p>Loading your saved tabs...</p>
+            <p role="status">Loading your saved tabs...</p>
           </div>
         ) : filtered.length === 0 ? (
           <div className="empty-state">
-            <p>No tabs found for this filter.</p>
-            {(searchQuery || filterType !== 'all') && (
+            <h2>{pages.length === 0 ? 'Your library starts here' : 'No matching tabs'}</h2><p>{pages.length === 0 ? 'Save tabs from the extension popup to keep them here.' : 'Try a different search or clear your filters.'}</p>
+            {(searchQuery || JSON.stringify(filters)!==JSON.stringify(emptyFilters)) && (
               <button
                 onClick={() => {
-                  setSelectedFilter('All');
-                  setFilterType('all');
+                  setSearchQuery('');
+                  setFilters({...emptyFilters});
                 }}
               >
                 Show all tabs
@@ -334,21 +184,16 @@ export const Library: React.FC<LibraryProps> = ({
             )}
           </div>
         ) : (
-          filtered.map(p => (
-            <PageCard
-              key={p.id || p.url_normalized}
-              page={p}
-              onToggleImportant={onToggleImportant}
-              onToggleUrgent={onToggleUrgent}
-              onDelete={onDelete}
-            />
-          ))
+          <VirtualPageGrid pages={filtered} grouped={grouped} render={p=><PageCard key={p.id||p.url_normalized} page={p} onToggleImportant={onToggleImportant} relevance={searchQuery.trim()?(p as any).search_score:undefined} onToggleUrgent={onToggleUrgent} onDelete={onDelete} onSelectPage={onSelectPage} selectionMode={selectionMode} selected={selectedIds?.has(p.id!)} onToggleSelection={onToggleSelection} onCompletionUpdated={onCompletionUpdated}/>}/>
+
         )}
       </div>
 
-      <footer>
-        Karl X · {filtered.length} tab{filtered.length === 1 ? '' : 's'} shown
+      <footer className="library-footer">
+        <button className="pill" onClick={onRefresh}>Refresh library</button>
+        <span>{filtered.length} resource{filtered.length === 1 ? '' : 's'}{JSON.stringify(filters)!==JSON.stringify(emptyFilters) || searchQuery ? ` of ${pages.length}` : ''}</span>
       </footer>
+      </>}
     </>
   );
 };

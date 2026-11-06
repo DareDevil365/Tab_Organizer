@@ -23,6 +23,7 @@ class Page(Base):
     tags: Mapped[str | None] = mapped_column(Text, nullable=True)
     is_important: Mapped[bool] = mapped_column(Boolean, default=False)
     is_urgent: Mapped[bool] = mapped_column(Boolean, default=False)
+    completed_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     created_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime.datetime] = mapped_column(DateTime(timezone=True), onupdate=func.now(), server_default=func.now())
     last_seen_open_at: Mapped[datetime.datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)

@@ -51,6 +51,7 @@ async def export_database(
             "tags": p.tags,
             "is_important": p.is_important,
             "is_urgent": p.is_urgent,
+            "completed_at": p.completed_at.replace(tzinfo=datetime.timezone.utc).isoformat() if p.completed_at else None,
             "created_at": p.created_at.isoformat() if p.created_at else None,
             "updated_at": p.updated_at.isoformat() if p.updated_at else None,
         }
@@ -145,6 +146,13 @@ async def import_database(
         norm_url = p.get("url_normalized") or p.get("url_original")
         if not norm_url:
             continue
+        completed_at = None
+        if p.get('completed_at'):
+            try:
+                completed_at = datetime.datetime.fromisoformat(str(p['completed_at']).replace('Z', '+00:00'))
+                completed_at = completed_at.replace(tzinfo=datetime.timezone.utc) if completed_at.tzinfo is None else completed_at.astimezone(datetime.timezone.utc)
+            except (ValueError, TypeError):
+                raise HTTPException(status_code=422, detail='Invalid completion date in backup')
 
         stmt = select(Page).where(Page.url_normalized == norm_url)
         res = await db.execute(stmt)
@@ -156,6 +164,8 @@ async def import_database(
             existing.description = p.get("description") or existing.description
             existing.category = p.get("category") or existing.category
             existing.topic = p.get("topic") or existing.topic
+            if 'completed_at' in p:
+                existing.completed_at = completed_at
             page_id_mapping[p.get("id")] = existing.id
         else:
             new_page = Page(
@@ -171,6 +181,7 @@ async def import_database(
                 tags=p.get("tags"),
                 is_important=p.get("is_important", False),
                 is_urgent=p.get("is_urgent", False),
+                completed_at=completed_at,
             )
             db.add(new_page)
             await db.flush()

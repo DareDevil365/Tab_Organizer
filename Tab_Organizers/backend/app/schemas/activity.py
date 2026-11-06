@@ -23,6 +23,7 @@ class ActivityResponse(ActivityItem):
 
 
 class DomainUsage(BaseModel):
+    topic: Optional[str] = None
     domain: str
     duration_seconds: int
     percentage: float

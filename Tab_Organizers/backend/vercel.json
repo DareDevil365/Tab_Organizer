@@ -1,0 +1,11 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "regions": ["bom1"],
+  "functions": {
+    "app/main.py": {
+      "maxDuration": 300,
+      "excludeFiles": "{.env*,data/**,tests/**,scripts/**,*.log,*.sqlite3,*.db,**/__pycache__/**,.pytest_cache/**,.venv/**,venv/**}"
+    }
+  },
+  "crons": [{"path": "/api/maintenance", "schedule": "0 3 * * *"}]
+}

@@ -42,7 +42,10 @@ class GeminiProvider(AIProvider):
     def __init__(self, api_key: Optional[str] = None):
         raw_key = api_key or settings.GEMINI_API_KEY or ""
         self.api_keys = [k.strip() for k in raw_key.split(",") if k.strip()]
-        self.models = ["gemini-2.5-flash", "gemini-flash-latest", "gemini-2.5-flash-lite", "gemini-2.5-pro"]
+        self.models = ["gemini-flash-lite-latest", "gemini-pro-latest", "gemini-flash-latest"]
+        if settings.cloud:
+            self.api_keys=self.api_keys[:1]
+            self.models=[settings.GEMINI_MODEL]
         self.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
 
     async def classify_batch(
@@ -74,10 +77,10 @@ class GeminiProvider(AIProvider):
         last_err = None
         for key in self.api_keys:
             for model in self.models:
-                url = f"{self.base_url}/{model}:generateContent?key={key}"
+                url = f"{self.base_url}/{model}:generateContent"
                 try:
                     async with httpx.AsyncClient(timeout=25.0) as client:
-                        resp = await client.post(url, json=payload)
+                        resp = await client.post(url, json=payload,headers={'x-goog-api-key':key})
                         if resp.status_code == 429:
                             logger.warning(f"Gemini key rate-limited (429) on {model}, trying next key...")
                             continue
@@ -117,10 +120,10 @@ class GeminiProvider(AIProvider):
         last_err = None
         for key in self.api_keys:
             for model in self.models:
-                url = f"{self.base_url}/{model}:generateContent?key={key}"
+                url = f"{self.base_url}/{model}:generateContent"
                 try:
                     async with httpx.AsyncClient(timeout=30.0) as client:
-                        resp = await client.post(url, json=payload)
+                        resp = await client.post(url, json=payload,headers={'x-goog-api-key':key})
                         if resp.status_code == 429:
                             continue
                         if resp.status_code >= 400:
@@ -538,6 +541,11 @@ class FallbackAIProvider(AIProvider):
 async def get_ai_provider() -> AIProvider:
     """Factory returning configured providers wrapped in an automatic fallback chain."""
     providers: List[AIProvider] = []
+    if settings.cloud:
+        # An exhausted free provider must not silently switch to another billable
+        # service or try to start a local model in a serverless function.
+        if not settings.GEMINI_API_KEY:raise RuntimeError('Gemini is not configured')
+        return GeminiProvider()
     primary = (settings.AI_PROVIDER or "openrouter").lower()
 
     if primary == "gemini" and settings.GEMINI_API_KEY:

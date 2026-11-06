@@ -7,6 +7,6 @@ router = APIRouter(prefix="/api/graph", tags=["graph"])
 
 
 @router.get("")
-async def get_graph(limit: int = Query(default=150, ge=10, le=500), db: AsyncSession = Depends(get_db)):
+async def get_graph(limit: int | None = Query(default=None, ge=1, le=5000), db: AsyncSession = Depends(get_db)):
     """Returns the full knowledge graph nodes and edges for network visualization."""
     return await build_knowledge_graph(db, limit=limit)

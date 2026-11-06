@@ -47,3 +47,8 @@ Thumbs.db
 
 # === Exports ===
 exports/
+
+# Private cloud configuration; templates remain tracked.
+.env.cloud
+.env.cloud.local
+.vercel/

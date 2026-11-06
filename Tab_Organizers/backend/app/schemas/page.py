@@ -1,6 +1,6 @@
 from datetime import datetime
-from pydantic import BaseModel, ConfigDict
-from typing import Optional
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt
+from typing import Optional, Literal
 
 class PageBase(BaseModel):
     url_original: str
@@ -35,6 +35,11 @@ class PageUpdate(BaseModel):
 
 class PageResponse(PageBase):
     id: int
+    display_topic: Optional[str] = None
+    subject_topics: list[str] = Field(default_factory=list)
+    note_count: int = 0
+    completed_at: Optional[datetime] = None
+    completion_kind: Literal['watched', 'read'] = 'read'
     created_at: datetime
     updated_at: datetime
     last_seen_open_at: Optional[datetime] = None
@@ -42,11 +47,20 @@ class PageResponse(PageBase):
     model_config = ConfigDict(from_attributes=True)
 
 
+class CompletionUpdate(BaseModel):
+    completed: bool
+
+
+class BulkCompletionUpdate(CompletionUpdate):
+    page_ids: list[PositiveInt] = Field(min_length=1, max_length=1000)
+
+
 class BulkSaveRequest(BaseModel):
     tabs: list[PageCreate]
 
 
 class BulkSaveResponse(BaseModel):
+    saved_pages: list[dict] = []
     total_submitted: int
     new_saved_count: int
     updated_count: int

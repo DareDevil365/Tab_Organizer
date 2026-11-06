@@ -1,4 +1,4 @@
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from typing import Optional, List
 import datetime
 
@@ -18,6 +18,7 @@ class TabGroupBase(BaseModel):
 
 class TabGroupCreate(TabGroupBase):
     tabs: List[TabItem] = []
+    client_id: Optional[str] = Field(default=None, min_length=16, max_length=80)
 
 class TabGroupUpdate(BaseModel):
     name: Optional[str] = None

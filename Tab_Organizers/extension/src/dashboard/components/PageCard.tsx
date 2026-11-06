@@ -1,11 +1,19 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { PageData } from '../../types';
+import { CompletionButton } from './CompletionButton';
+import { coverInk } from '../../lib/cover-palette';
 
 interface PageCardProps {
+  relevance?: number;
   page: PageData & { id?: number; tags?: string; is_important?: boolean; is_urgent?: boolean; created_at?: string };
   onToggleImportant?: (pageId: number, currentVal: boolean) => void;
   onToggleUrgent?: (pageId: number, currentVal: boolean) => void;
   onDelete?: (pageId: number) => void;
+  onSelectPage?: (pageId: number) => void;
+  selectionMode?: boolean;
+  selected?: boolean;
+  onToggleSelection?: (pageId: number) => void;
+  onCompletionUpdated?: (page: PageData) => void;
 }
 
 function extractYoutubeThumbnail(url?: string): string | null {
@@ -14,30 +22,23 @@ function extractYoutubeThumbnail(url?: string): string | null {
   return match ? `https://i.ytimg.com/vi/${match[1]}/hqdefault.jpg` : null;
 }
 
-function getDomainHue(domain?: string): number {
-  if (!domain) return 210;
-  let hash = 0;
-  for (let i = 0; i < domain.length; i++) {
-    hash = domain.charCodeAt(i) + ((hash << 5) - hash);
-  }
-  return Math.abs(hash) % 360;
-}
-
 function isMeaningfulTopic(topic?: string): boolean {
   if (!topic) return false;
   const lower = topic.trim().toLowerCase();
   return !['general', 'other', 'uncategorized', 'none', 'unknown', ''].includes(lower);
 }
 
-function initial(str?: string): string {
-  return (str || '?').trim().charAt(0).toUpperCase();
-}
-
 export const PageCard: React.FC<PageCardProps> = ({
+  relevance,
   page,
   onToggleImportant,
   onToggleUrgent,
   onDelete,
+  onSelectPage,
+  selectionMode = false,
+  selected = false,
+  onToggleSelection,
+  onCompletionUpdated,
 }) => {
   const targetUrl = page.url_original || page.url_normalized || '#';
   const domain = page.domain || (page.url_original ? (() => {
@@ -49,8 +50,9 @@ export const PageCard: React.FC<PageCardProps> = ({
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const hue = getDomainHue(domain);
-  const favicon = page.favicon_url || `https://www.google.com/s2/favicons?domain=${domain}&sz=64`;
+  const topic = page.display_topic || page.topic;
+  const coverTopic = isMeaningfulTopic(topic) ? topic! : page.category || 'Saved resource';
+  const ink = coverInk(coverTopic === 'Saved resource' ? page.title || '' : coverTopic);
 
   useEffect(() => {
     const handleClickOutside = (e: MouseEvent) => {
@@ -102,16 +104,37 @@ export const PageCard: React.FC<PageCardProps> = ({
     }
   };
 
+  const handleOpenDetail = (e: React.MouseEvent) => {
+    if(page.pendingSync&&page.id!<0){e.preventDefault();if(!selectionMode)window.open(targetUrl,'_blank','noopener');return;}
+    if (selectionMode && page.id) { e.preventDefault(); onToggleSelection?.(page.id); return; }
+    if (page.id && onSelectPage) {
+      e.preventDefault();
+      onSelectPage(page.id);
+    }
+  };
+
   return (
     <div className="card-container">
-      <a
-        href={targetUrl}
-        target="_blank"
-        rel="noopener noreferrer"
-        className="card"
+      <div
+        className={`card ${selectionMode ? 'card-selectable' : ''} ${selected ? 'card-selected' : ''}`}
+        data-page-id={page.id}
         title={page.title || targetUrl}
+        role={onSelectPage ? 'button' : undefined}
+        tabIndex={onSelectPage ? 0 : undefined}
+        aria-label={`${selectionMode ? 'Select ' : ''}${page.title || targetUrl}`}
+        aria-pressed={selectionMode ? selected : undefined}
+        onKeyDown={(e) => {
+          if (e.target === e.currentTarget && (e.key === 'Enter' || e.key === ' ')) {
+            e.preventDefault();
+            if (page.id) { if (selectionMode) onToggleSelection?.(page.id); else onSelectPage?.(page.id); }
+          }
+        }}
+        style={{ cursor: onSelectPage ? 'pointer' : 'default' }}
+        onClick={handleOpenDetail}
       >
         <div className="thumb-wrap">
+          {relevance !== undefined && <span className="search-relevance" title="Relative relevance score out of 100, not a probability or certainty">{relevance}<small>/100</small></span>}
+          {selectionMode && <span className={`card-selection-mark ${selected ? 'is-selected' : ''}`} aria-hidden="true">{selected ? '✓' : ''}</span>}
           {rawThumb && !imgError ? (
             <img
               className="cover"
@@ -124,20 +147,11 @@ export const PageCard: React.FC<PageCardProps> = ({
             <div
               className="thumb-fallback"
               style={{
-                background: `linear-gradient(135deg, hsl(${hue}, 45%, 28%), hsl(${(hue + 40) % 360}, 50%, 16%))`
+                background: `linear-gradient(135deg, ${ink.from}, ${ink.to})`
               }}
             >
-              {page.favicon_url ? (
-                <img
-                  className="favicon"
-                  src={page.favicon_url}
-                  alt=""
-                  onError={(e) => { (e.target as HTMLElement).style.display = 'none'; }}
-                />
-              ) : (
-                <span style={{ fontSize: 24, fontWeight: 700 }}>{initial(domain)}</span>
-              )}
-              <span className="domain-label">{domain}</span>
+              <span className="cover-topic">{coverTopic}</span>
+              <span className="cover-title">{page.title || domain}</span>
             </div>
           )}
 
@@ -148,42 +162,25 @@ export const PageCard: React.FC<PageCardProps> = ({
           </div>
         </div>
 
+        {page.pendingSync&&<small className="pending-label">Saved on device · Pending upload</small>}
         <div className="card-row">
-          <div className="avatar">
-            <img
-              src={favicon}
-              alt=""
-              onError={(e) => { (e.target as HTMLElement).src = 'public/icons/icon16.png'; }}
-            />
-          </div>
-
           <div className="card-text">
-            <div className="card-title">
-              {page.title || targetUrl}
-            </div>
-
+            <div className="card-title">{page.title || domain}</div>
             <div className="card-meta">
-              <span>{domain}</span>
-              {page.description && (
-                <span> · {page.description}</span>
-              )}
-            </div>
-
-            <div className="card-badges-row">
-              {page.is_important && (
-                <span className="badge badge-important">★ Important</span>
-              )}
-              {page.is_urgent && (
-                <span className="badge badge-urgent">🔥 Urgent</span>
-              )}
-              {isMeaningfulTopic(page.topic) && (
-                <span className="topic-pill">#{page.topic}</span>
+              <span className="card-topic-dot" aria-hidden="true" style={{ background: ink.dot }} />
+              <span>{isMeaningfulTopic(topic) ? topic : page.category || domain}</span>
+              {(page.note_count || 0) > 0 && (
+                <span className="card-note-count" title={`${page.note_count} saved note${page.note_count === 1 ? '' : 's'}`}>
+                  <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true"><path d="M8 3h11v18H5V3h3ZM8 3v18M11 8h5m-5 4h5"/></svg>
+                  {page.note_count} note{page.note_count === 1 ? '' : 's'}
+                </span>
               )}
             </div>
           </div>
 
+          {!selectionMode && onCompletionUpdated && <CompletionButton page={page} onUpdated={onCompletionUpdated} />}
           {/* 3-dots YouTube Style Menu right beside the title */}
-          <div
+          {!selectionMode && <div
             className="dots-menu-wrapper"
             ref={menuRef}
             onClick={(e) => {
@@ -199,12 +196,33 @@ export const PageCard: React.FC<PageCardProps> = ({
                 setMenuOpen(!menuOpen);
               }}
               title="More actions"
+              aria-label={`More actions for ${page.title || domain}`}
+              aria-expanded={menuOpen}
+              aria-haspopup="menu"
             >
               ⋮
             </button>
 
             {menuOpen && (
               <div className="dots-dropdown">
+                {page.id && onSelectPage && (
+                  <button className="dropdown-item" onClick={handleOpenDetail}>
+                    <span className="item-icon">📝</span>
+                    <span>View Notes & Assistant</span>
+                  </button>
+                )}
+
+                <a
+                  href={targetUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="dropdown-item"
+                  style={{ textDecoration: 'none', color: 'inherit' }}
+                >
+                  <span className="item-icon">↗</span>
+                  <span>Open in New Tab</span>
+                </a>
+
                 <button className="dropdown-item" onClick={handleImportantClick}>
                   <span className="item-icon">{page.is_important ? '★' : '☆'}</span>
                   <span>{page.is_important ? 'Unmark Important' : 'Mark as Important'}</span>
@@ -228,9 +246,9 @@ export const PageCard: React.FC<PageCardProps> = ({
                 </button>
               </div>
             )}
-          </div>
+          </div>}
         </div>
-      </a>
+      </div>
     </div>
   );
 };

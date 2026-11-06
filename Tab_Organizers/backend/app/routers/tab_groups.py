@@ -65,6 +65,24 @@ async def create_group(group_in: TabGroupCreate, db: AsyncSession = Depends(get_
     Saves a tab group without polluting the main library pages database.
     Stores all contained tab URLs, titles, and icons cleanly within the group record.
     """
+    # The marker and group commit together, so a lost HTTP acknowledgement can
+    # be retried without creating another collection. Row locking serializes
+    # retries arriving from the popup and worker at the same time.
+    marker = None
+    if group_in.client_id:
+        from app.models.cloud_state import AppDocument
+        if db.bind.dialect.name == 'postgresql':
+            from sqlalchemy.dialects.postgresql import insert
+        else:
+            from sqlalchemy.dialects.sqlite import insert
+        key='client-group:'+group_in.client_id
+        await db.execute(insert(AppDocument).values(key=key,payload='null').on_conflict_do_nothing(index_elements=['key']))
+        marker=(await db.execute(select(AppDocument).where(AppDocument.key==key).with_for_update())).scalar_one()
+        previous=json.loads(marker.payload)
+        if previous:
+            existing=await db.get(TabGroup,previous['id'])
+            if not existing: raise HTTPException(409,'This collection was removed. Save a new collection instead.')
+            return _group_to_response(existing)
     tabs_list = [t.model_dump() for t in group_in.tabs]
     tabs_json = json.dumps(tabs_list)
     count = len(tabs_list)
@@ -78,6 +96,8 @@ async def create_group(group_in: TabGroupCreate, db: AsyncSession = Depends(get_
         saved_html_export_path=group_in.saved_html_export_path
     )
     db.add(new_group)
+    await db.flush()
+    if marker is not None: marker.payload=json.dumps({'id':new_group.id})
     await db.commit()
     await db.refresh(new_group)
     return _group_to_response(new_group)

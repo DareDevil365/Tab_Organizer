@@ -1,6 +1,9 @@
 import { apiClient } from '../lib/api-client';
 import { storage } from '../lib/storage';
+import { flushSaves, saveOnDevice } from '../lib/outbox';
 import { normalizeUrl } from '../lib/url-normalize';
+import { ActivityTracker, TrackingContext } from '../lib/activity-tracker';
+import { openFloatingPanel, authorizeFloatingPanel, floatingSessionKey } from '../lib/floating-panel';
 import {
   getNextContrastingGroupColor,
   markGroupColorUsed,
@@ -9,21 +12,12 @@ import {
 
 const HEALTH_ALARM = 'backend-health-check';
 const FLUSH_ACTIVITY_ALARM = 'flush-activity-logs';
+chrome.storage.onChanged.addListener(changes=>{if(changes.backend_connection)void flushSaves(true);});
 
-interface ActiveTabSession {
-  tabId: number;
-  url: string;
-  domain: string;
-  startedAt: number; // ms
-}
-
-interface QueuedActivity {
-  url: string;
-  domain: string;
-  started_at: string;
-  ended_at: string;
-  duration_seconds: number;
-}
+chrome.action.onClicked.addListener(tab => {
+  void openFloatingPanel(tab).catch(error => console.debug('Could not open tabs panel:', error));
+});
+chrome.tabs.onRemoved.addListener(tabId => { void chrome.storage.session.remove(floatingSessionKey(tabId)); });
 
 export interface ClosedWindowTab {
   title: string;
@@ -64,8 +58,6 @@ export interface BrowserSessionSnapshot {
   windows: BrowserWindowSnapshot[];
 }
 
-let currentSession: ActiveTabSession | null = null;
-let isUserActive = true;
 let lastKnownBackendStatus: 'connected' | 'disconnected' | 'checking' = 'checking';
 
 // In-memory active window tracking + persisted to storage for Service Worker sleep safety
@@ -117,6 +109,7 @@ chrome.runtime.onInstalled.addListener(async () => {
   await storage.set('browser_startup_time', now);
   storage.setBackendStatus('checking');
   setupAlarms();
+  await activityTracker.checkpoint({ discardPrevious: true });
   setupContextMenus();
   await snapshotAllWindows();
 });
@@ -127,6 +120,7 @@ chrome.runtime.onStartup.addListener(async () => {
   await storage.set('browser_startup_time', now);
   storage.setBackendStatus('checking');
   setupAlarms();
+  await activityTracker.checkpoint({ discardPrevious: true });
   checkPendingReminders();
   await snapshotAllWindows();
 });
@@ -153,7 +147,7 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
   if (info.menuItemId === 'save-to-library' && tab?.url) {
     const targetUrl = info.linkUrl || tab.url;
     try {
-      await apiClient.post('/api/pages', {
+      await saveOnDevice('page', {
         url_original: targetUrl,
         url_normalized: normalizeUrl(targetUrl),
         title: tab.title || targetUrl,
@@ -164,14 +158,14 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
         type: 'basic',
         iconUrl: 'public/icons/icon48.png',
         title: 'Tab Organizer',
-        message: 'Saved to your personal library!'
+        message: 'Saved on this device. Uploading to your library when connected.'
       });
     } catch {
       chrome.notifications.create({
         type: 'basic',
         iconUrl: 'public/icons/icon48.png',
         title: 'Tab Organizer',
-        message: 'Failed to save page. Ensure backend is running.'
+        message: 'Could not save on this device. Check that the page has a web address and device storage is available.'
       });
     }
   }
@@ -181,8 +175,9 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 chrome.alarms.onAlarm.addListener(async (alarm) => {
   if (alarm.name === HEALTH_ALARM) {
     await checkBackendHealth();
+    await flushSaves();
   } else if (alarm.name === FLUSH_ACTIVITY_ALARM) {
-    await flushActivityLogs();
+    await activityTracker.checkpoint({ flush: true });
   }
 });
 
@@ -204,111 +199,52 @@ async function checkBackendHealth() {
   }
 }
 
-// 3. Time Tracking & Tab Listeners
-chrome.tabs.onActivated.addListener(async (activeInfo) => {
-  await endCurrentSession();
-  await startSessionForTab(activeInfo.tabId);
+// 3. Time tracking: focused active web tab only, with durable 30-second checkpoints.
+async function getTrackingContext(): Promise<TrackingContext | null> {
+  try {
+    const idleState = await new Promise<chrome.idle.IdleState>(resolve => chrome.idle.queryState(60, resolve));
+    if (idleState !== 'active') return null;
+    const win = await chrome.windows.getLastFocused({ populate: false, windowTypes: ['normal'] });
+    if (!win.focused || win.id === undefined || win.state === 'minimized') return null;
+    const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
+    if (!tab?.id || !tab.url || !/^https?:\/\//i.test(tab.url)) return null;
+    return { tabId: tab.id, url: tab.url, domain: new URL(tab.url).hostname.replace(/^www\./i, '') };
+  } catch { return null; }
+}
+
+const activityTracker = new ActivityTracker({
+  now: Date.now,
+  context: getTrackingContext,
+  read: () => chrome.storage.local.get(['activity_queue', 'activity_current_session_v2']),
+  write: state => chrome.storage.local.set(state),
+  upload: activities => apiClient.post('/api/activity', { activities }),
+});
+chrome.idle.setDetectionInterval(60);
+const checkpointActivity = () => activityTracker.checkpoint().catch(error => console.debug('Activity checkpoint deferred:', error));
+
+chrome.tabs.onActivated.addListener(async activeInfo => {
+  try {
+    const win = await chrome.windows.get(activeInfo.windowId);
+    if (win.focused) await checkpointActivity();
+  } catch {}
   debouncedSnapshot();
 });
-
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
-  if (currentSession && currentSession.tabId === tabId && changeInfo.url) {
-    await endCurrentSession();
-    await startSessionForTab(tabId);
+  if (changeInfo.url) {
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.active && (await chrome.windows.get(tab.windowId)).focused) await checkpointActivity();
+    } catch {}
   }
-  if (changeInfo.status === 'complete' || changeInfo.url || changeInfo.title) {
-    debouncedSnapshot();
-  }
+  if (changeInfo.status === 'complete' || changeInfo.url || changeInfo.title) debouncedSnapshot();
 });
-
 chrome.tabs.onCreated.addListener(() => debouncedSnapshot());
-chrome.tabs.onRemoved.addListener(() => debouncedSnapshot());
+chrome.tabs.onRemoved.addListener(() => { checkpointActivity(); debouncedSnapshot(); });
 chrome.tabs.onMoved.addListener(() => debouncedSnapshot());
 chrome.tabs.onAttached.addListener(() => debouncedSnapshot());
 chrome.tabs.onDetached.addListener(() => debouncedSnapshot());
-
-chrome.windows.onFocusChanged.addListener(async (windowId) => {
-  if (windowId === chrome.windows.WINDOW_ID_NONE) {
-    await endCurrentSession();
-  } else {
-    const [tab] = await chrome.tabs.query({ active: true, windowId });
-    if (tab?.id) {
-      await startSessionForTab(tab.id);
-    }
-  }
-  debouncedSnapshot();
-});
-
-chrome.idle.onStateChanged.addListener(async (newState) => {
-  isUserActive = (newState === 'active');
-  if (!isUserActive) {
-    await endCurrentSession();
-  } else {
-    const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
-    if (tab?.id) {
-      await startSessionForTab(tab.id);
-    }
-  }
-});
-
-async function startSessionForTab(tabId: number) {
-  if (!isUserActive) return;
-
-  try {
-    const tab = await chrome.tabs.get(tabId);
-    if (tab && tab.url && tab.url.startsWith('http')) {
-      const domain = new URL(tab.url).hostname;
-      currentSession = {
-        tabId,
-        url: tab.url,
-        domain,
-        startedAt: Date.now()
-      };
-    }
-  } catch {
-    currentSession = null;
-  }
-}
-
-async function endCurrentSession() {
-  if (!currentSession) return;
-
-  const now = Date.now();
-  const durationMs = now - currentSession.startedAt;
-  const durationSeconds = Math.round(durationMs / 1000);
-
-  if (durationSeconds >= 2 && currentSession.url.startsWith('http')) {
-    const activity: QueuedActivity = {
-      url: currentSession.url,
-      domain: currentSession.domain,
-      started_at: new Date(currentSession.startedAt).toISOString(),
-      ended_at: new Date(now).toISOString(),
-      duration_seconds: durationSeconds
-    };
-
-    await queueActivity(activity);
-  }
-
-  currentSession = null;
-}
-
-async function queueActivity(activity: QueuedActivity) {
-  const currentQueue = (await storage.get<QueuedActivity[]>('activity_queue')) || [];
-  currentQueue.push(activity);
-  await storage.set('activity_queue', currentQueue);
-}
-
-async function flushActivityLogs() {
-  const queue = await storage.get<QueuedActivity[]>('activity_queue');
-  if (!queue || queue.length === 0) return;
-
-  try {
-    await apiClient.post('/api/activity', { activities: queue });
-    await storage.set('activity_queue', []);
-  } catch (error) {
-    console.debug('Failed to flush activity logs to backend, will retry next alarm.');
-  }
-}
+chrome.windows.onFocusChanged.addListener(() => { checkpointActivity(); debouncedSnapshot(); });
+chrome.idle.onStateChanged.addListener(() => { checkpointActivity(); });
 
 // 4. Live Windows Snapshot Engine (Always Persisted)
 let snapshotTimeout: any = null;
@@ -584,7 +520,7 @@ async function restoreTabGroupsForWindow(
     for (const [origGroupId, tabIds] of groupTabsMap.entries()) {
       if (tabIds.length === 0) continue;
       try {
-        const newGroupId = await chrome.tabs.group({ tabIds, windowId });
+        const newGroupId = await chrome.tabs.group({ tabIds, createProperties: { windowId } });
         const meta = groups.find(g => g.id === origGroupId);
         if (meta && (meta.title || meta.color)) {
           await chrome.tabGroups.update(newGroupId, {
@@ -603,6 +539,17 @@ async function restoreTabGroupsForWindow(
 
 // 7. Message Handlers for Reincarnation
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === 'FLUSH_SAVE_OUTBOX') { flushSaves().then(()=>sendResponse({ok:true}),()=>sendResponse({ok:false})); return true; }
+  if (message.type === 'AUTHORIZE_FLOATING_PANEL') {
+    authorizeFloatingPanel(message.token, _sender).then(allowed => sendResponse({ allowed }))
+      .catch(() => sendResponse({ allowed: false }));
+    return true;
+  }
+  if (message.type === 'FLUSH_ACTIVITY_NOW') {
+    activityTracker.checkpoint({ flush: true }).then(() => sendResponse({ success: true }))
+      .catch(() => sendResponse({ success: false }));
+    return true;
+  }
   // Reincarnate Single Closed Window
   if (message.type === 'RESTORE_CLOSED_WINDOW' && message.session) {
     const session: ClosedWindowSession = message.session;
@@ -615,7 +562,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           return;
         }
 
-        const newWin = await chrome.windows.create({ url: urls, focused: true, populate: true });
+        const newWin = await chrome.windows.create({ url: urls, focused: true });
 
         if (newWin.id && session.groups && session.groups.length > 0) {
           const actualTabs = await getTabsForWindow(newWin.id, urls.length);
@@ -766,7 +713,7 @@ chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
           const urls = validTabs.map(t => t.url);
           if (urls.length === 0) continue;
 
-          const createdWin = await chrome.windows.create({ url: urls, focused: i === 0, populate: true });
+          const createdWin = await chrome.windows.create({ url: urls, focused: i === 0 });
           if (createdWin.id) {
             newWindowIds.add(createdWin.id);
             createdWindowsCount++;

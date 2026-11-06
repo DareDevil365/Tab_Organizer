@@ -1,4 +1,5 @@
 import re
+from typing import Optional
 from urllib.parse import urlparse, urlunparse, parse_qsl, urlencode
 
 

@@ -2,20 +2,45 @@ import base64
 import datetime
 from typing import List, Optional
 from urllib.parse import urlparse
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, status, Response
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select, or_
+from sqlalchemy import select, or_, func, delete, update
+from sqlalchemy.orm import defer
 
 from app.database import get_db
+from app.config import settings
 from app.models.page import Page
-from app.schemas.page import PageCreate, PageUpdate, PageResponse, BulkSaveRequest, BulkSaveResponse
+from app.models.companion import CompanionNote
+from app.models.embedding import PageEmbedding
+from app.models.tab_group import PageGroupLink
+from app.models.activity import ActivityLog
+from app.models.reminder import Reminder
+from app.schemas.page import PageCreate, PageUpdate, PageResponse, BulkSaveRequest, BulkSaveResponse, CompletionUpdate, BulkCompletionUpdate
+from app.services.completion import completion_kind
+from app.services.content_subjects import subject_path, library_subjects
+from app.services.video_metadata import resolve_video_title, generic_title
 from app.services.url_normalizer import normalize_url, extract_youtube_thumbnail
 from app.services.classifier import classify_single_page_rule, run_background_classification, suggest_page_tags
 
 router = APIRouter(prefix="/api/pages", tags=["pages"])
 
 
-def _format_page(page: Page) -> PageResponse:
+async def _remove_page(db: AsyncSession, page: Page):
+    # Remove owned records atomically. Otherwise startup's legacy-note repair
+    # recreates a page that the user deliberately deleted.
+    from app.services.recycle_bin import archive_page
+    note_ids,recycle_id = await archive_page(db, page)
+    await db.execute(delete(CompanionNote).where(CompanionNote.id.in_(note_ids)))
+    await db.execute(delete(PageEmbedding).where(PageEmbedding.page_id == page.id))
+    await db.execute(delete(PageGroupLink).where(PageGroupLink.page_id == page.id))
+    await db.execute(delete(Reminder).where(Reminder.page_id == page.id))
+    await db.execute(update(ActivityLog).where(ActivityLog.page_id == page.id).values(page_id=None))
+    await db.delete(page)
+    await db.commit()
+    return recycle_id
+
+
+def _format_page(page: Page, note_count: int = 0) -> PageResponse:
     domain = page.domain or (urlparse(page.url_original).netloc.replace('www.', '') if page.url_original else '')
     yt_thumb = extract_youtube_thumbnail(page.url_original)
 
@@ -28,6 +53,11 @@ def _format_page(page: Page) -> PageResponse:
 
     return PageResponse(
         id=page.id,
+        display_topic=subject_path(page)[-1] if subject_path(page) != ('Needs a Topic',) else None,
+        subject_topics=library_subjects(page),
+        note_count=note_count,
+        completed_at=(page.completed_at.replace(tzinfo=datetime.timezone.utc) if page.completed_at and page.completed_at.tzinfo is None else page.completed_at),
+        completion_kind=completion_kind(page),
         url_original=page.url_original,
         url_normalized=page.url_normalized,
         title=page.title or domain or "Untitled",
@@ -64,6 +94,7 @@ async def upsert_page(
         raise HTTPException(status_code=400, detail="Invalid URL")
 
     domain = page_in.domain
+    page_in.title = await resolve_video_title(page_in.url_original, page_in.title)
     if not domain and page_in.url_original:
         domain = urlparse(page_in.url_original).netloc
 
@@ -77,7 +108,7 @@ async def upsert_page(
 
     if page:
         # Update existing
-        if page_in.title:
+        if page_in.title and (not generic_title(page_in.title,page_in.url_original) or generic_title(page.title,page.url_original)):
             page.title = page_in.title
         if page_in.description:
             page.description = page_in.description
@@ -147,7 +178,7 @@ async def upsert_page(
     await db.commit()
     await db.refresh(page)
 
-    if needs_bg_classification:
+    if needs_bg_classification and not settings.cloud:
         background_tasks.add_task(run_background_classification, batch_size=10, limit=20)
 
     return _format_page(page)
@@ -175,6 +206,17 @@ async def bulk_save_pages(
     updated_count = 0
     needs_bg_classification = False
 
+    # Bound optional title enrichment for the entire batch. Serial oEmbed
+    # lookups used to make a large save exceed the device's upload timeout.
+    import asyncio
+    gate=asyncio.Semaphore(4)
+    async def enrich_title(tab):
+        async with gate: tab.title=await resolve_video_title(tab.url_original,tab.title)
+    tasks=[asyncio.create_task(enrich_title(tab)) for tab in payload.tabs if generic_title(tab.title,tab.url_original)]
+    if tasks:
+        _,pending=await asyncio.wait(tasks,timeout=6)
+        for task in pending: task.cancel()
+        await asyncio.gather(*tasks,return_exceptions=True)
     for tab_in in payload.tabs:
         if not tab_in.url_original or not tab_in.url_original.startswith("http"):
             continue
@@ -192,7 +234,7 @@ async def bulk_save_pages(
 
         if existing:
             # Already saved in library -> refresh metadata and timestamp
-            if tab_in.title and existing.title in ("Untitled", "", None):
+            if tab_in.title and generic_title(existing.title,existing.url_original):
                 existing.title = tab_in.title
             if tab_in.description and not existing.description:
                 existing.description = tab_in.description
@@ -276,7 +318,7 @@ async def bulk_save_pages(
 
     await db.commit()
 
-    if needs_bg_classification:
+    if needs_bg_classification and not settings.cloud:
         background_tasks.add_task(run_background_classification, batch_size=15, limit=50)
 
     if new_count > 0:
@@ -286,12 +328,29 @@ async def bulk_save_pages(
     else:
         msg = "No new tabs to save."
 
+    saved=(await db.execute(select(Page).where(Page.url_normalized.in_([
+        tab.url_normalized or normalize_url(tab.url_original) for tab in payload.tabs if tab.url_original.startswith('http')
+    ])))).scalars().all()
     return BulkSaveResponse(
+        saved_pages=[{'id':page.id,'url_original':page.url_original,'url_normalized':page.url_normalized,
+                      'title':page.title,'description':page.description or '', 'favicon_url':page.favicon_url or '',
+                      'domain':page.domain,'created_at':page.created_at} for page in saved],
         total_submitted=len(payload.tabs),
         new_saved_count=new_count,
         updated_count=updated_count,
         message=msg
     )
+
+
+@router.get('/saved-status')
+async def saved_status(db: AsyncSession = Depends(get_db)):
+    """Small uncapped URL/topic index for live tabs; no images or model work."""
+    pages = (await db.execute(select(Page).options(defer(Page.og_image_data)))).scalars().all()
+    from app.services.graph_service import cached_topic_metadata
+    topics = await cached_topic_metadata(pages)
+    return [{'url_original': page.url_original, 'url_normalized': page.url_normalized,
+             'display_topic': topics.get(page.id, {}).get('display_topic') or
+                (subject_path(page)[-1] if subject_path(page) != ('Needs a Topic',) else None)} for page in pages]
 
 
 @router.get("", response_model=List[PageResponse])
@@ -302,12 +361,23 @@ async def list_pages(
     search: Optional[str] = None,
     is_important: Optional[bool] = None,
     is_urgent: Optional[bool] = None,
+    has_notes: Optional[bool] = None,
+    completed: Optional[bool] = None,
     limit: int = Query(default=100, le=5000),
     offset: int = Query(default=0, ge=0),
     db: AsyncSession = Depends(get_db)
 ):
     """Lists saved pages with optional filtering, search, and pagination."""
-    query = select(Page).order_by(Page.created_at.desc())
+    counts = select(CompanionNote.page_id.label('page_id'), func.count(CompanionNote.id).label('note_count')).group_by(CompanionNote.page_id).subquery()
+    # Bulk imports share timestamps. A unique tie-breaker keeps LIMIT/OFFSET
+    # pages disjoint on PostgreSQL, where equal timestamps have no stable order.
+    query = select(Page, func.coalesce(counts.c.note_count, 0)).outerjoin(counts, counts.c.page_id == Page.id).order_by(Page.created_at.desc(),Page.id.desc())
+    if completed is not None:
+        query = query.where(Page.completed_at.is_not(None) if completed else Page.completed_at.is_(None))
+    if has_notes is True:
+        query = query.where(counts.c.note_count > 0)
+    elif has_notes is False:
+        query = query.where(func.coalesce(counts.c.note_count, 0) == 0)
 
     if domain:
         query = query.where(Page.domain == domain)
@@ -333,8 +403,34 @@ async def list_pages(
 
     query = query.limit(limit).offset(offset)
     res = await db.execute(query)
-    pages = res.scalars().all()
-    return [_format_page(p) for p in pages]
+    rows=res.all()
+    from app.services.graph_service import cached_topic_metadata
+    topics=await cached_topic_metadata([page for page, _ in rows])
+    return [_format_page(page,count).model_copy(update=topics.get(page.id,{})) for page,count in rows]
+
+
+@router.put('/completion', response_model=List[PageResponse])
+async def set_completion_bulk(payload: BulkCompletionUpdate, db: AsyncSession = Depends(get_db)):
+    ids = list(dict.fromkeys(payload.page_ids))
+    found = (await db.execute(select(Page.id).where(Page.id.in_(ids)))).scalars().all()
+    if len(found) != len(ids):
+        raise HTTPException(status_code=404, detail='One or more selected resources no longer exist')
+    now = datetime.datetime.now(datetime.timezone.utc)
+    query = update(Page).where(Page.id.in_(ids))
+    if payload.completed:
+        # Idempotent: retries cannot advance completion dates or inflate counts.
+        query = query.where(Page.completed_at.is_(None))
+    await db.execute(query.values(completed_at=now if payload.completed else None))
+    await db.commit()
+    pages = (await db.execute(select(Page).where(Page.id.in_(ids)).execution_options(populate_existing=True))).scalars().all()
+    counts = dict((await db.execute(select(CompanionNote.page_id, func.count(CompanionNote.id)).where(CompanionNote.page_id.in_(ids)).group_by(CompanionNote.page_id))).all())
+    return [_format_page(page, counts.get(page.id, 0)) for page in pages]
+
+
+@router.put('/{page_id}/completion', response_model=PageResponse)
+async def set_completion(page_id: int, payload: CompletionUpdate, db: AsyncSession = Depends(get_db)):
+    pages = await set_completion_bulk(BulkCompletionUpdate(page_ids=[page_id], completed=payload.completed), db)
+    return pages[0]
 
 
 @router.get("/{page_id}", response_model=PageResponse)
@@ -345,7 +441,10 @@ async def get_page(page_id: int, db: AsyncSession = Depends(get_db)):
     page = res.scalar_one_or_none()
     if not page:
         raise HTTPException(status_code=404, detail="Page not found")
-    return _format_page(page)
+    note_count = (await db.execute(select(func.count(CompanionNote.id)).where(CompanionNote.page_id == page.id))).scalar_one()
+    from app.services.graph_service import cached_topic_metadata
+    topics=await cached_topic_metadata([page])
+    return _format_page(page,note_count).model_copy(update=topics.get(page.id,{}))
 
 
 @router.put("/{page_id}", response_model=PageResponse)
@@ -377,9 +476,8 @@ async def delete_page_by_url(url: str = Query(...), db: AsyncSession = Depends(g
     if not page:
         return {"status": "not_found", "message": "Page was not in library"}
 
-    await db.delete(page)
-    await db.commit()
-    return {"status": "deleted", "message": "Page removed from library"}
+    recycle_id=await _remove_page(db, page)
+    return {"status": "deleted", "message": "Page removed from library", "recycle_id":recycle_id}
 
 
 @router.delete("/{page_id}", status_code=status.HTTP_204_NO_CONTENT)
@@ -391,6 +489,5 @@ async def delete_page(page_id: int, db: AsyncSession = Depends(get_db)):
     if not page:
         raise HTTPException(status_code=404, detail="Page not found")
 
-    await db.delete(page)
-    await db.commit()
-    return None
+    recycle_id=await _remove_page(db, page)
+    return Response(status_code=204,headers={'X-Recycle-Id':recycle_id})

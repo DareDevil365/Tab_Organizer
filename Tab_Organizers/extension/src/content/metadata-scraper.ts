@@ -21,7 +21,13 @@ export function extractPageMetadata(): ScrapedPageMetadata {
   const ogTitle = document.querySelector('meta[property="og:title"]')?.getAttribute('content');
   const twitterTitle = document.querySelector('meta[name="twitter:title"]')?.getAttribute('content');
   const docTitle = document.title;
-  const title = (ogTitle || twitterTitle || docTitle || domain).trim();
+  const watchPage = /(^|\.)youtube\.com$/.test(domain) && /\/(?:watch|shorts)/.test(location.pathname);
+  const visibleVideoTitle = watchPage ? document.querySelector('ytd-watch-metadata h1, h1.title yt-formatted-string, #title h1 yt-formatted-string')?.textContent?.trim() : '';
+  const meaningfulTitle = (value: string | null | undefined) => {
+    const text = (value || '').trim();
+    return text && !['youtube', 'untitled', domain, domain.replace(/^www\./, '')].includes(text.toLowerCase()) && !/^https?:\/\//i.test(text);
+  };
+  const title = ([visibleVideoTitle, ogTitle, twitterTitle, docTitle].find(meaningfulTitle) || docTitle || domain).trim();
 
   // 2. Description extraction
   const ogDesc = document.querySelector('meta[property="og:description"]')?.getAttribute('content');

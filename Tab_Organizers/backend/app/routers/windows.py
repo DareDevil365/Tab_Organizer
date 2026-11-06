@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional
 from pydantic import BaseModel, field_validator
 from fastapi import APIRouter, HTTPException
+from app.services.state_store import read_json, write_json, mutate_json
 
 router = APIRouter(prefix="/api/windows", tags=["windows"])
 
@@ -81,19 +82,16 @@ class BrowserSessionCreate(BaseModel):
 # ---------------------------------------------------------------------------
 
 def _read_json_file(path: Path) -> List[Dict[str, Any]]:
-    if not path.exists():
-        return []
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return []
+    return read_json(path,[])
 
 
 def _write_json_file(path: Path, data: List[Dict[str, Any]], limit: int) -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(data[:limit], f, ensure_ascii=False, indent=2)
+    write_json(path,data[:limit])
+
+
+async def _mutate_sessions(path, limit, lock, transform):
+    async with lock:
+        return await asyncio.to_thread(mutate_json,path,[],lambda rows:transform(rows)[:limit])
 
 
 async def _load_sessions() -> List[Dict[str, Any]]:
@@ -151,32 +149,26 @@ async def get_recently_closed_windows(limit: int = 30, recent_only: bool = True)
 @router.post("/closed")
 async def save_closed_window(payload: ClosedWindowCreate):
     """Saves a closed single-window snapshot."""
-    sessions = await _load_sessions()
-
-    if any(s.get("session_id") == payload.session_id for s in sessions):
-        return {"status": "already_recorded", "session_id": payload.session_id}
-
-    new_entry = payload.model_dump()
-    sessions.insert(0, new_entry)
-    sessions = sessions[:MAX_CLOSED_WINDOWS]
-    await _save_sessions(sessions)
-
-    return {"status": "saved", "session_id": payload.session_id, "tab_count": payload.tab_count}
+    recorded=False
+    def add(rows):
+        nonlocal recorded
+        recorded=any(row.get('session_id')==payload.session_id for row in rows)
+        return rows if recorded else [payload.model_dump(),*rows]
+    await _mutate_sessions(CLOSED_WINDOWS_FILE,MAX_CLOSED_WINDOWS,_closed_windows_lock,add)
+    return {"status": "already_recorded" if recorded else "saved", "session_id": payload.session_id, "tab_count": payload.tab_count}
 
 
 @router.delete("/closed/{session_id}")
 async def delete_closed_window(session_id: str):
     """Deletes a closed single-window session."""
-    sessions = await _load_sessions()
-    filtered = [s for s in sessions if s.get("session_id") != session_id]
-    await _save_sessions(filtered)
+    await _mutate_sessions(CLOSED_WINDOWS_FILE,MAX_CLOSED_WINDOWS,_closed_windows_lock,lambda rows:[s for s in rows if s.get('session_id')!=session_id])
     return {"status": "deleted", "session_id": session_id}
 
 
 @router.delete("/closed")
 async def clear_all_closed_windows():
     """Clears all single-window closed history."""
-    await _save_sessions([])
+    await _mutate_sessions(CLOSED_WINDOWS_FILE,MAX_CLOSED_WINDOWS,_closed_windows_lock,lambda rows:[])
     return {"status": "cleared"}
 
 
@@ -216,15 +208,8 @@ async def get_browser_sessions():
 @router.post("/browser-sessions")
 async def save_browser_session(payload: BrowserSessionCreate):
     """Saves or updates a multi-window browser shutdown session (retains strictly last 2)."""
-    sessions = await _load_browser_sessions()
-
-    # Remove existing entry with same session_id to allow updates during clustering
-    sessions = [s for s in sessions if s.get("session_id") != payload.session_id]
-
-    new_entry = payload.model_dump()
-    sessions.insert(0, new_entry)
-    sessions = sessions[:MAX_SAVED_BROWSER_SESSIONS]
-    await _save_browser_sessions(sessions)
+    sessions=await _mutate_sessions(BROWSER_SESSIONS_FILE,MAX_SAVED_BROWSER_SESSIONS,_browser_sessions_lock,
+        lambda rows:[payload.model_dump(),*[s for s in rows if s.get('session_id')!=payload.session_id]])
 
     return {
         "status": "saved",
@@ -238,14 +223,12 @@ async def save_browser_session(payload: BrowserSessionCreate):
 @router.delete("/browser-sessions/{session_id}")
 async def delete_browser_session(session_id: str):
     """Deletes a specific browser session."""
-    sessions = await _load_browser_sessions()
-    filtered = [s for s in sessions if s.get("session_id") != session_id]
-    await _save_browser_sessions(filtered)
+    await _mutate_sessions(BROWSER_SESSIONS_FILE,MAX_SAVED_BROWSER_SESSIONS,_browser_sessions_lock,lambda rows:[s for s in rows if s.get('session_id')!=session_id])
     return {"status": "deleted", "session_id": session_id}
 
 
 @router.delete("/browser-sessions")
 async def clear_all_browser_sessions():
     """Clears all cached browser sessions."""
-    await _save_browser_sessions([])
+    await _mutate_sessions(BROWSER_SESSIONS_FILE,MAX_SAVED_BROWSER_SESSIONS,_browser_sessions_lock,lambda rows:[])
     return {"status": "cleared"}
