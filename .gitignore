@@ -1,0 +1,40 @@
+# Private configuration
+.env
+.env.*
+!.env.example
+!.env.cloud.example
+.vercel/
+
+# Runtime state and local backups
+/Tab_Organizers/data/
+/Tab_Organizers/backend/data/
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+*.log
+exports/
+
+# Generated files
+node_modules/
+dist/
+build/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+output/
+.playwright-cli/
+
+# Local project planning and reviews
+/Tab_Organizers/.context/
+/FEATURE_RESEARCH.md
+/PROJECT_GUIDE.md
+/SKILL_DISCOVERY_REVIEW.md
+/Tab_Organizers/DESIGN.md
+/Tab_Organizers/HTML_Design.html
+/Tab_Organizers/popup_design.html
+/Tab_Organizers/ui_audit.html
+/UI_REDESIGN_PLAN.md
+/UX_REVIEW.md

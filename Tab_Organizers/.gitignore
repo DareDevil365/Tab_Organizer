@@ -1,0 +1,49 @@
+# === Secrets ===
+.env
+.env.local
+.env.*.local
+
+# === Python ===
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+.venv/
+venv/
+env/
+
+# === Node ===
+node_modules/
+extension/dist/
+extension/.vite/
+
+# === Database ===
+backend/data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# === IDE ===
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# === Build artifacts ===
+*.pyc
+*.pyo
+
+# === Alembic ===
+# Keep versions tracked
+!backend/alembic/versions/.gitkeep
+
+# === Exports ===
+exports/
