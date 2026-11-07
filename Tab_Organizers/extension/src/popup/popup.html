@@ -103,6 +103,21 @@
     <button type="button" class="link-btn" id="btn-deselect-all" hidden>Clear</button>
     <span class="count" id="tab-counter-text" hidden><span id="selected-count">0</span> selected<span id="total-count" hidden>0</span></span>
     <button type="button" id="btn-save-selected" class="save-selected" hidden disabled>Save selected</button>
+    <button type="button" id="btn-wake-tabs" class="wake-tabs-button" data-sky="night" aria-label="Wake sleeping tabs" title="Wake sleeping tabs in this window">
+      <svg viewBox="0 0 40 40" width="32" height="32" fill="none" aria-hidden="true">
+        <defs>
+          <radialGradient id="wake-night"><stop stop-color="#244967"/><stop offset="1" stop-color="#101e35"/></radialGradient>
+          <radialGradient id="wake-day" cx=".38" cy=".28" r=".9"><stop stop-color="#ffe3a1"/><stop offset=".6" stop-color="#edaf4c"/><stop offset="1" stop-color="#c97332"/></radialGradient>
+          <linearGradient id="wake-gold" x2="1" y2="1"><stop stop-color="#fff0bc"/><stop offset="1" stop-color="#c7994e"/></linearGradient>
+        </defs>
+        <circle cx="20" cy="20" r="18.5" fill="url(#wake-night)"/>
+        <circle class="wake-day-sky" cx="20" cy="20" r="18.5" fill="url(#wake-day)"/>
+        <g class="wake-moon"><path d="M23.4 8.2a9 9 0 1 0 6.2 13.4 8.2 8.2 0 0 1-6.2-13.4Z" fill="url(#wake-gold)"/><path d="m12 9 .4 1.1 1.1.4-1.1.4-.4 1.1-.4-1.1-1.1-.4 1.1-.4Z" fill="#dfca96"/></g>
+        <g class="wake-sun"><circle cx="20" cy="17" r="6.5" fill="#ffe796" stroke="#fff0c2" stroke-width=".7"/><path d="M20 7v-2m0 24v-2M10 17H8m24 0h-2M13 10l-1.4-1.4m16.8 16.8L27 24M27 10l1.4-1.4M13 24l-1.4 1.4" stroke="#fff0bc" stroke-width="1" stroke-linecap="round"/></g>
+        <path class="wake-cloud" d="M8 26h13c2.7 0 2.7-3 0-3h-2.1a3.6 3.6 0 0 0-6.7-1.4A2.6 2.6 0 0 0 8 24h-1m14 5h10m-6-3h7" stroke="#dfc48b" stroke-width=".85" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="20" cy="20" r="18.5" stroke="#d9ba75" stroke-opacity=".65" stroke-width=".7"/>
+      </svg>
+    </button>
   </div>
 
   <!-- Main Scrollable Tab Area -->

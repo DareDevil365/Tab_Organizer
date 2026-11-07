@@ -2227,6 +2227,17 @@ button { cursor:pointer; }
 .select-row .link-btn { padding:0; border:0; background:transparent; color:var(--ink-muted); font-size:10px; font-weight:400; }
 .select-row .link-btn:hover { color:var(--ink-text); text-decoration:none; }
 .select-row .count { color:var(--ink-subtle); font-size:9px; margin-left:2px; }
+.wake-tabs-button { margin-left:auto; flex:0 0 32px; width:32px; height:32px; display:grid; place-items:center; padding:0; border:0; border-radius:50%; background:transparent; cursor:pointer; }
+.wake-tabs-button svg { display:block; overflow:visible; }
+.wake-tabs-button[hidden] { display:none; }
+.wake-tabs-button:focus-visible { outline:2px solid #d9ba75; outline-offset:3px; }
+.wake-tabs-button:not(:disabled):hover { filter:brightness(1.15); }
+.wake-tabs-button:disabled { cursor:default; opacity:1; }
+.wake-tabs-button .wake-day-sky,.wake-tabs-button .wake-sun { opacity:0; }
+.wake-tabs-button .wake-moon,.wake-tabs-button .wake-sun,.wake-tabs-button .wake-day-sky { transition:opacity 240ms ease; }
+.wake-tabs-button[data-sky="day"] .wake-day-sky,.wake-tabs-button[data-sky="day"] .wake-sun { opacity:1; }
+.wake-tabs-button[data-sky="day"] .wake-moon { opacity:0; }
+@media (prefers-reduced-motion:reduce) { .wake-tabs-button .wake-moon,.wake-tabs-button .wake-sun,.wake-tabs-button .wake-day-sky { transition:none; } }
 .save-selected { margin-left:auto; padding:0; background:transparent; border:0; color:var(--ink-muted); font-size:10px; }
 .save-selected:disabled { opacity:.38; cursor:default; }
 main#main-content { flex:1 1 0; min-height:0; max-height:none; padding:0 14px 5px; overflow:auto; scrollbar-width:thin; scrollbar-color:var(--ink-raised) transparent; }

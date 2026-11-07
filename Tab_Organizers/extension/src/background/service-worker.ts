@@ -3,6 +3,7 @@ import { storage } from '../lib/storage';
 import { flushSaves, saveOnDevice } from '../lib/outbox';
 import { normalizeUrl } from '../lib/url-normalize';
 import { ActivityTracker, TrackingContext } from '../lib/activity-tracker';
+import { TabWakeManager } from '../lib/wake-tabs';
 import { openFloatingPanel, authorizeFloatingPanel, floatingSessionKey } from '../lib/floating-panel';
 import {
   getNextContrastingGroupColor,
@@ -12,6 +13,10 @@ import {
 
 const HEALTH_ALARM = 'backend-health-check';
 const FLUSH_ACTIVITY_ALARM = 'flush-activity-logs';
+// Keep the wake queue in the worker so closing the small panel does not cancel it.
+const tabWakeManager = new TabWakeManager(chrome.tabs, progress => {
+  void chrome.runtime.sendMessage({ type: 'TAB_WAKE_PROGRESS', progress }).catch(() => {});
+});
 chrome.storage.onChanged.addListener(changes=>{if(changes.backend_connection)void flushSaves(true);});
 
 chrome.action.onClicked.addListener(tab => {
@@ -539,6 +544,15 @@ async function restoreTabGroupsForWindow(
 
 // 7. Message Handlers for Reincarnation
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === 'GET_TAB_WAKE_STATUS') {
+    sendResponse({ success: true, progress: tabWakeManager.status() });
+    return false;
+  }
+  if (message.type === 'WAKE_SLEEPING_TABS') {
+    tabWakeManager.start(message.windowId).then(progress => sendResponse({ success: true, progress }))
+      .catch(() => sendResponse({ success: false, error: 'Could not read tabs in this window' }));
+    return true;
+  }
   if (message.type === 'FLUSH_SAVE_OUTBOX') { flushSaves().then(()=>sendResponse({ok:true}),()=>sendResponse({ok:false})); return true; }
   if (message.type === 'AUTHORIZE_FLOATING_PANEL') {
     authorizeFloatingPanel(message.token, _sender).then(allowed => sendResponse({ allowed }))

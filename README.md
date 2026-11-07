@@ -8,6 +8,10 @@ from saved content.
 Tabs, notes, and collections save to the browser first. If the backend is
 unreachable, the extension keeps them pending and uploads them after reconnecting.
 
+The moon button in Open tabs wakes sleeping tabs in the current window and
+refreshes their titles. It turns into a golden sun and works through all eligible
+tabs, two at a time, without switching the active tab.
+
 ## Install the extension
 
 1. Install Node.js 22.12 or later and clone this repository.

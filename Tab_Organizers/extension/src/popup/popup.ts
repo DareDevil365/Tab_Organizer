@@ -8,6 +8,7 @@ import { storage } from '../lib/storage';
 import { normalizeUrl } from '../lib/url-normalize';
 import { notesForOpenTabs } from '../lib/session-notes';
 import { createSiteIcon } from '../lib/site-icon';
+import { needsTabWake, WakeProgress } from '../lib/wake-tabs';
 import { preparePopupHost, closePopup, copyPopupText } from '../lib/popup-host';
 import { extractPageMetadata, ScrapedPageMetadata } from '../content/metadata-scraper';
 import {
@@ -104,6 +105,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const deleteTabsText = document.getElementById('delete-tabs-btn-text') as HTMLSpanElement;
   const btnOpenDashboard = document.getElementById('btn-open-dashboard') as HTMLButtonElement;
   const btnSelectAll = document.getElementById('btn-select-all') as HTMLSpanElement;
+  const btnWakeTabs = document.getElementById('btn-wake-tabs') as HTMLButtonElement;
   const btnDeselectAll = document.getElementById('btn-deselect-all') as HTMLSpanElement;
   const selectedCountSpan = document.getElementById('selected-count') as HTMLSpanElement;
   const totalCountSpan = document.getElementById('total-count') as HTMLSpanElement;
@@ -191,6 +193,21 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   let allOpenTabs: ExtendedTab[] = [];
+  let wakeProgress: WakeProgress | null = null;
+  let wakeStarting = false;
+  function updateWakeButton() {
+    if (!btnWakeTabs) return;
+    const candidates = allOpenTabs.filter(needsTabWake).length;
+    const busy = wakeStarting || !!wakeProgress?.running;
+    btnWakeTabs.hidden = currentMode !== 'library';
+    btnWakeTabs.disabled = busy || candidates === 0;
+    btnWakeTabs.dataset.sky = busy || candidates === 0 ? 'day' : 'night';
+    const label = busy ? (wakeProgress?.running ? `Waking tabs · ${wakeProgress.completed} of ${wakeProgress.total}` : 'Waking sleeping tabs…') :
+      candidates ? `Wake ${candidates} sleeping or untitled tab${candidates === 1 ? '' : 's'} in this window` : 'All tabs are awake';
+    btnWakeTabs.title = label;
+    btnWakeTabs.setAttribute('aria-label', label);
+    btnWakeTabs.setAttribute('aria-busy', String(busy));
+  }
   let companionReady = false;
   let notesLoad: Promise<void> | null = null;
   let allGroups: chrome.tabGroups.TabGroup[] = [];
@@ -553,6 +570,39 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   await refreshTabsFromChrome();
+  const receiveWakeProgress = (message: { type?: string; progress?: WakeProgress }) => {
+    if (message.type !== 'TAB_WAKE_PROGRESS' || !message.progress || message.progress.revision < (wakeProgress?.revision ?? 0)) return;
+    const wasRunning = !!wakeProgress?.running || wakeStarting;
+    wakeProgress = message.progress;
+    updateWakeButton();
+    if (wasRunning && !wakeProgress.running) {
+      if (wakeProgress.windowId === selectedWindowId) {
+        const summary = `Woke ${wakeProgress.woken} tab${wakeProgress.woken === 1 ? '' : 's'}`;
+        showToast(wakeProgress.failed ? `${summary} · ${wakeProgress.failed} could not finish. Use the moon to retry.` : summary, wakeProgress.failed ? 'info' : 'success', 4000);
+      }
+      void refreshTabsFromChrome();
+    }
+  };
+  chrome.runtime.onMessage.addListener(receiveWakeProgress);
+  window.addEventListener('unload', () => chrome.runtime.onMessage.removeListener(receiveWakeProgress));
+  void sendMessageWithTimeout({ type: 'GET_TAB_WAKE_STATUS' }).then(response => {
+    if (response?.success && !wakeStarting && !wakeProgress?.running && response.progress.revision >= (wakeProgress?.revision ?? 0)) {
+      wakeProgress = response.progress;
+      updateWakeButton();
+    }
+  });
+  btnWakeTabs?.addEventListener('click', async () => {
+    if (wakeStarting || wakeProgress?.running || selectedWindowId === undefined || selectedWindowId === null) return;
+    wakeStarting = true;
+    updateWakeButton();
+    try {
+      const response = await sendMessageWithTimeout({ type: 'WAKE_SLEEPING_TABS', windowId: selectedWindowId });
+      if (!response?.success) throw new Error('Wake request failed');
+      // A fast batch may already have sent its completion event before the ack.
+      if (!wakeProgress || response.progress.revision >= wakeProgress.revision) wakeProgress = response.progress;
+    } catch { showToast('Could not wake tabs. Try again.', 'error'); }
+    finally { wakeStarting = false; updateWakeButton(); }
+  });
   void loadSavedGroups();
   updateGroupBadges();
 
@@ -2075,6 +2125,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   }
 
   function renderTabs() {
+    updateWakeButton();
     const list=document.getElementById('main-content');
     const listBounds=list?.getBoundingClientRect();
     const visibleRows=listBounds?[...container.querySelectorAll<HTMLElement>('.library-item')].filter(row=>{const bounds=row.getBoundingClientRect();return bounds.bottom>listBounds.top&&bounds.top<listBounds.bottom;}):[];
