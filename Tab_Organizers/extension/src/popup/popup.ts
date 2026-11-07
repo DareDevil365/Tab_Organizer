@@ -8,7 +8,8 @@ import { storage } from '../lib/storage';
 import { normalizeUrl } from '../lib/url-normalize';
 import { notesForOpenTabs } from '../lib/session-notes';
 import { createSiteIcon } from '../lib/site-icon';
-import { needsTabWake, WakeProgress } from '../lib/wake-tabs';
+import { needsTabWake, TabWakeManager, WakeProgress } from '../lib/wake-tabs';
+import { WakeClient } from '../lib/wake-client';
 import { preparePopupHost, closePopup, copyPopupText } from '../lib/popup-host';
 import { extractPageMetadata, ScrapedPageMetadata } from '../content/metadata-scraper';
 import {
@@ -185,10 +186,16 @@ document.addEventListener('DOMContentLoaded', async () => {
   ): Promise<any> {
     return new Promise((resolve) => {
       const timer = setTimeout(() => resolve({ success: false, error: 'timeout' }), timeoutMs);
-      chrome.runtime.sendMessage(msg, (res) => {
+      try {
+        chrome.runtime.sendMessage(msg, (res) => {
+          clearTimeout(timer);
+          const error = chrome.runtime.lastError;
+          resolve(error ? { success: false, error: error.message || 'no_response' } : res || { success: false, error: 'no_response' });
+        });
+      } catch {
         clearTimeout(timer);
-        resolve(res || { success: false, error: 'no_response' });
-      });
+        resolve({ success: false, error: 'worker_unavailable' });
+      }
     });
   }
 
@@ -571,7 +578,7 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   await refreshTabsFromChrome();
   const receiveWakeProgress = (message: { type?: string; progress?: WakeProgress }) => {
-    if (message.type !== 'TAB_WAKE_PROGRESS' || !message.progress || message.progress.revision < (wakeProgress?.revision ?? 0)) return;
+    if (message.type !== 'TAB_WAKE_PROGRESS' || !message.progress || (message.progress.ownerId === wakeProgress?.ownerId && message.progress.revision < (wakeProgress?.revision ?? 0))) return;
     const wasRunning = !!wakeProgress?.running || wakeStarting;
     wakeProgress = message.progress;
     updateWakeButton();
@@ -585,9 +592,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   };
   chrome.runtime.onMessage.addListener(receiveWakeProgress);
   window.addEventListener('unload', () => chrome.runtime.onMessage.removeListener(receiveWakeProgress));
-  void sendMessageWithTimeout({ type: 'GET_TAB_WAKE_STATUS' }).then(response => {
-    if (response?.success && !wakeStarting && !wakeProgress?.running && response.progress.revision >= (wakeProgress?.revision ?? 0)) {
-      wakeProgress = response.progress;
+  const panelWakeManager = new TabWakeManager(chrome.tabs, progress => receiveWakeProgress({ type: 'TAB_WAKE_PROGRESS', progress }));
+  const wakeClient = new WakeClient(message => sendMessageWithTimeout(message, 2000), panelWakeManager);
+  void wakeClient.status().then(progress => {
+    if (!wakeStarting && !wakeProgress?.running && (progress.ownerId !== wakeProgress?.ownerId || progress.revision >= (wakeProgress?.revision ?? 0))) {
+      wakeProgress = progress;
       updateWakeButton();
     }
   });
@@ -596,11 +605,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     wakeStarting = true;
     updateWakeButton();
     try {
-      const response = await sendMessageWithTimeout({ type: 'WAKE_SLEEPING_TABS', windowId: selectedWindowId });
-      if (!response?.success) throw new Error('Wake request failed');
+      const progress = await wakeClient.start(selectedWindowId);
+      if (wakeClient.panelRunning) showToast('Waking tabs here · Keep this panel open until they finish.', 'info', 4000);
       // A fast batch may already have sent its completion event before the ack.
-      if (!wakeProgress || response.progress.revision >= wakeProgress.revision) wakeProgress = response.progress;
-    } catch { showToast('Could not wake tabs. Try again.', 'error'); }
+      if (!wakeProgress || progress.ownerId !== wakeProgress.ownerId || progress.revision >= wakeProgress.revision) wakeProgress = progress;
+    } catch { showToast('Browser tabs could not be read. Reload Tab Organizer on the Extensions page, then reopen this panel.', 'error', 6000); }
     finally { wakeStarting = false; updateWakeButton(); }
   });
   void loadSavedGroups();

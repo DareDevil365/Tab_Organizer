@@ -12,6 +12,7 @@ export interface WakeTab {
 }
 
 export interface WakeProgress {
+  ownerId: string;
   revision: number;
   running: boolean;
   windowId: number | null;
@@ -76,7 +77,7 @@ function reloadUntilReady(browser: WakeBrowser, id: number, timeoutMs: number): 
 }
 
 export class TabWakeManager {
-  private progress: WakeProgress = { revision: 0, running: false, windowId: null, total: 0, completed: 0, woken: 0, failed: 0, skipped: 0 };
+  private progress: WakeProgress = { ownerId: crypto.randomUUID(), revision: 0, running: false, windowId: null, total: 0, completed: 0, woken: 0, failed: 0, skipped: 0 };
   private starting: Promise<WakeProgress> | null = null;
   private job: Promise<void> | null = null;
   constructor(private browser: WakeBrowser, private notify: (progress: WakeProgress) => void, private timeoutMs = 15000) {}
@@ -88,10 +89,13 @@ export class TabWakeManager {
     this.starting = this.prepare(windowId).finally(() => { this.starting = null; });
     return this.starting;
   }
-  private publish() { this.progress.revision++; this.notify(this.status()); }
+  private publish() {
+    this.progress.revision++;
+    try { this.notify(this.status()); } catch { /* A closed panel must not fail the wake queue. */ }
+  }
   private async prepare(windowId: number): Promise<WakeProgress> {
     const tabs = (await this.browser.query({ windowId })).filter(tab => tab.windowId === windowId && needsTabWake(tab));
-    this.progress = { revision: this.progress.revision, running: tabs.length > 0, windowId, total: tabs.length, completed: 0, woken: 0, failed: 0, skipped: 0 };
+    this.progress = { ownerId: this.progress.ownerId, revision: this.progress.revision, running: tabs.length > 0, windowId, total: tabs.length, completed: 0, woken: 0, failed: 0, skipped: 0 };
     this.publish();
     if (tabs.length) this.job = this.run(tabs).finally(() => { this.job = null; });
     return this.status();

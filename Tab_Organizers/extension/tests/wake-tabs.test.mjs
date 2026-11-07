@@ -92,3 +92,11 @@ test('offline or stalled loads time out and can be retried without a stuck busy 
   await until(() => !f.manager.status().running);
   assert.equal(f.manager.status().woken, 1);
 });
+
+test('a progress listener failure does not prevent waking or strand the queue', async () => {
+  const f=fixture([tab(1)]);
+  f.manager['notify']=()=>{throw Error('Panel receiver disconnected');};
+  await f.manager.start(1);await until(()=>f.reloaded.length===1);f.complete(1);
+  await until(()=>!f.manager.status().running);
+  assert.equal(f.manager.status().woken,1);
+});

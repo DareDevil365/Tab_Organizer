@@ -15,7 +15,7 @@ const HEALTH_ALARM = 'backend-health-check';
 const FLUSH_ACTIVITY_ALARM = 'flush-activity-logs';
 // Keep the wake queue in the worker so closing the small panel does not cancel it.
 const tabWakeManager = new TabWakeManager(chrome.tabs, progress => {
-  void chrome.runtime.sendMessage({ type: 'TAB_WAKE_PROGRESS', progress }).catch(() => {});
+  void Promise.resolve(chrome.runtime.sendMessage({ type: 'TAB_WAKE_PROGRESS', progress })).catch(() => {});
 });
 chrome.storage.onChanged.addListener(changes=>{if(changes.backend_connection)void flushSaves(true);});
 
