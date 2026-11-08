@@ -14,7 +14,7 @@ class ApiClient {
       const connection=await getBackendConnection();
       const response = await fetch(`${connection.url}${endpoint}`, {
         ...options,
-        signal:options?.signal||AbortSignal.timeout(endpoint.includes('/brain/')||endpoint==='/api/graph'||endpoint==='/api/search'?120000:15000),
+        signal:options?.signal||AbortSignal.timeout(endpoint.includes('/brain/')||endpoint==='/api/graph'||endpoint==='/api/search'||endpoint==='/api/activity/classify'?120000:15000),
         headers: {
           'Content-Type': 'application/json',
           ...options?.headers,

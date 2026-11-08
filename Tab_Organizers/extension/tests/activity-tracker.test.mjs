@@ -42,3 +42,18 @@ test('startup discards stale browser-closed time and delayed heartbeats are boun
   assert.equal(f.state.activity_queue.length,0); f.advance(7200); await f.tracker.checkpoint();
   assert.equal(f.state.activity_queue[0].duration_seconds,90);
 });
+
+test('late video title and channel enrich only the matching active URL, without borrowing the next video',async()=>{
+ const f=fixture();
+ f.setContext({tabId:1,url:'https://example.com/first',domain:'example.com',title:'www.youtube.com'});
+ await f.tracker.checkpoint();f.advance(30);
+ f.setContext({tabId:1,url:'https://example.com/first',domain:'example.com',title:'An electronics experiment',channel:'Maker channel'});
+ await f.tracker.checkpoint();
+ assert.equal(f.state.activity_queue[0].title,'An electronics experiment');
+ assert.equal(f.state.activity_queue[0].channel,'Maker channel');
+ f.advance(30);f.setContext({tabId:2,url:'https://example.com/second',domain:'example.com',title:'A mathematics lecture',channel:'Math channel'});
+ await f.tracker.checkpoint();
+ assert.equal(f.state.activity_queue[1].title,'An electronics experiment');
+ assert.equal(f.state.activity_queue[1].channel,'Maker channel');
+ assert.equal(f.state.activity_current_session_v2.title,'A mathematics lecture');
+});

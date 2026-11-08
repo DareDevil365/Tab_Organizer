@@ -20,7 +20,10 @@ export function useLibrarySearch<T extends PageData>(pages: T[], query: string) 
     setPending(true); setError(false);
     const timer = setTimeout(() => {
       apiClient.post<Response>('/api/search', { query: cleaned }, controller.signal)
-        .then(value => { if (!controller.signal.aborted) setResult({ ...value, query: cleaned }); })
+        .then(value => {
+          if (!value || !Array.isArray(value.results)) throw new Error('Search response is incomplete');
+          if (!controller.signal.aborted) setResult({ ...value, query: cleaned });
+        })
         .catch(() => { if (!controller.signal.aborted) { setResult(null); setError(true); } })
         .finally(() => { if (!controller.signal.aborted) setPending(false); });
     }, 350);

@@ -11,8 +11,14 @@ export function applyLibraryFilters<T extends PageData>(pages:T[],filters:Librar
 }
 
 export function pageTopics(page: PageData): string[] {
-  const labels = page.subject_topics ?? [page.display_topic || page.topic || ''];
-  return [...new Set(labels.filter(label => label && !['general','other','unknown','uncategorized','none','needs a topic'].includes(label.toLowerCase()) && !/https?:\/\/|\b\w+\.\w+\b/i.test(label)))];
+  // Generated subtopics extend existing subjects; they do not erase them.
+  const labels = [...(page.subject_topics || []), page.display_topic || '', page.topic || ''];
+  const seen = new Set<string>();
+  return labels.map(label=>label.trim()).filter(label => {
+    const key=label.toLowerCase();
+    if(!label||seen.has(key)||['general','other','unknown','uncategorized','none','needs a topic'].includes(key)||/https?:\/\/|\b\w+\.\w+\b/i.test(label))return false;
+    seen.add(key);return true;
+  });
 }
 
 export function pageDomain(page: PageData): string {

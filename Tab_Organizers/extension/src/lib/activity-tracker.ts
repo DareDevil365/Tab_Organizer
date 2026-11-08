@@ -1,8 +1,9 @@
 /** Durable focused-tab checkpoints. Browser events and upload share one queue. */
-export interface TrackingContext { tabId: number; url: string; domain: string }
+export interface TrackingContext { tabId: number; url: string; domain: string; title?: string; channel?: string; description?: string }
 interface Session extends TrackingContext { startedAt: number }
 export interface ActivityInterval {
   url: string; domain: string; started_at: string; ended_at: string; duration_seconds: number;
+  title?: string; channel?: string; description?: string;
 }
 interface TrackingState { activity_queue?: ActivityInterval[]; activity_current_session_v2?: Session | null }
 interface Dependencies {
@@ -30,6 +31,9 @@ export class ActivityTracker {
         const duration = Math.floor(Math.max(0, Math.min(now - previous.startedAt, 90000)) / 1000);
         if (duration >= 2) queue.push({
           url: previous.url, domain: previous.domain,
+          title: (context?.url === previous.url ? context.title : undefined) || previous.title,
+          channel: (context?.url === previous.url ? context.channel : undefined) || previous.channel,
+          description: (context?.url === previous.url ? context.description : undefined) || previous.description,
           started_at: new Date(previous.startedAt).toISOString(),
           ended_at: new Date(previous.startedAt + duration * 1000).toISOString(), duration_seconds: duration,
         });

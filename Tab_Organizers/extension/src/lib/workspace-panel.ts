@@ -7,6 +7,10 @@ export async function registerWorkspacePanel(): Promise<void> {
   if (tab?.id === undefined) return;
   const tabId = tab.id;
   chrome.runtime.onMessage.addListener((message, sender, respond) => {
+    if(message?.type==='CLOSE_WORKSPACE_PANEL'&&message.tabId===tabId&&sender.id===chrome.runtime.id&&!sender.tab){
+      document.getElementById('karlx-floating-panel')?.dispatchEvent(new Event('karlx-dismiss'));
+      respond({closed:true});return false;
+    }
     if (message?.type !== 'TOGGLE_WORKSPACE_PANEL' || message.tabId !== tabId ||
         sender.id !== chrome.runtime.id || sender.tab || typeof message.token !== 'string') return;
     const token = message.token;

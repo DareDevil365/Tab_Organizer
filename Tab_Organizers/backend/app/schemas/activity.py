@@ -1,12 +1,15 @@
 import datetime
 from typing import List, Optional
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class ActivityItem(BaseModel):
     url: str
     domain: str
     topic: Optional[str] = None
+    title: Optional[str] = Field(default=None, max_length=1000)
+    channel: Optional[str] = Field(default=None, max_length=300)
+    description: Optional[str] = Field(default=None, max_length=1500)
     started_at: datetime.datetime
     ended_at: datetime.datetime
     duration_seconds: int
@@ -14,6 +17,10 @@ class ActivityItem(BaseModel):
 
 class ActivityBatchCreate(BaseModel):
     activities: List[ActivityItem]
+
+
+class ActivityClassifyRequest(BaseModel):
+    limit: int = Field(default=20, ge=1, le=40)
 
 
 class ActivityResponse(ActivityItem):

@@ -28,6 +28,27 @@ export function TimeTracking({ onSelectPage }: { onSelectPage?: (id: number) => 
   const [days, setDays] = useState(7), [revision, setRevision] = useState(0);
   const [loading, setLoading] = useState(true), [error, setError] = useState('');
   const [showAllSites, setShowAllSites] = useState(false);
+  const [subjectStatus, setSubjectStatus] = useState('');
+  const [subjectRetry, setSubjectRetry] = useState(0);
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      setSubjectStatus('Updating subjects from watched content…');
+      try {
+        // Independent of summary loading: AI cannot hold up charts or totals.
+        for (let batch = 0; batch < 20 && active; batch++) {
+          const result = await apiClient.post<{classified:number;remaining:number;busy:boolean;unresolved?:number;provider_unavailable?:boolean}>('/api/activity/classify', {limit:20});
+          if (!active) return;
+          if (result.classified) setRevision(value => value + 1);
+          if (result.busy) { setSubjectStatus('Subjects are updating in the background.'); return; }
+          if (result.provider_unavailable) { setSubjectStatus('Subject analysis is temporarily unavailable. Browsing time is still recorded.'); return; }
+          if (!result.remaining) { setSubjectStatus(result.unresolved ? 'Some older entries need more context to identify their subject.' : ''); return; }
+        }
+        if (active) setSubjectStatus('More subjects will update as you browse.');
+      } catch { if (active) setSubjectStatus('Could not update subjects. Your recorded time is unchanged.'); }
+    })();
+    return () => { active = false; };
+  }, [subjectRetry]);
   useEffect(() => {
     let active = true; setLoading(true); setError('');
     (async () => {
@@ -72,7 +93,7 @@ export function TimeTracking({ onSelectPage }: { onSelectPage?: (id: number) => 
           <div className="browsing-breakdowns"><div className="browsing-sites-panel"><div className="browsing-panel-heading"><h3>Where the time went</h3><span>{websites.length} websites</span></div>
             <ol className="browsing-sites">{(showAllSites ? websites : websites.slice(0, 8)).map(site => <li key={site.domain}><span className="browsing-site-icon"><SiteIcon url={`https://${site.domain}`} /></span><div className="browsing-site-info"><strong>{site.domain}</strong><span>{site.topic && site.topic.toLowerCase() !== 'other' ? site.topic : 'Active browsing'}</span><div className="browsing-share-track"><span style={{ width: `${site.percentage}%` }} /></div></div><div className="browsing-site-time"><strong>{duration(site.duration_seconds)}</strong><small>{site.percentage}%</small></div></li>)}</ol>
             {websites.length > 8 && <button className="browsing-show-all" onClick={() => setShowAllSites(value => !value)}>{showAllSites ? 'Show fewer websites' : `Show all ${websites.length} websites`}</button>}
-          </div><div className="browsing-topics-panel"><div className="browsing-panel-heading"><h3>By subject</h3></div><p className="browsing-panel-note">Subjects come from saved pages. Other includes websites without a saved topic.</p>{summary.topic_breakdown.map(topic => <div className="browsing-topic" key={topic.topic}><div><span>{topic.topic.toLowerCase() === 'other' ? 'Other browsing' : topic.topic}</span><strong>{duration(topic.duration_seconds)}</strong></div><progress value={topic.percentage} max={100} aria-label={`${topic.topic}: ${topic.percentage}%`} /></div>)}</div></div>
+          </div><div className="browsing-topics-panel"><div className="browsing-panel-heading"><h3>By subject</h3><button className="browsing-show-all" onClick={() => setSubjectRetry(value => value + 1)}>Update subjects</button></div><p className="browsing-panel-note">Headings follow what you browse in this period, using content titles and channels—even when you haven’t saved the page. Smaller interests move down as your habits change.</p>{subjectStatus && <p className="browsing-panel-note" role="status">{subjectStatus}</p>}{summary.topic_breakdown.map(topic => <div className="browsing-topic" key={topic.topic}><div><span>{topic.topic.toLowerCase() === 'other' ? 'Not enough context yet' : topic.topic}</span><strong>{duration(topic.duration_seconds)}</strong></div><progress value={topic.percentage} max={100} aria-label={`${topic.topic}: ${topic.percentage}%`} /></div>)}</div></div>
         </> : <div className="browsing-empty"><h3>Your browsing time will appear here.</h3><p>Use the browser with the extension enabled. Only your focused, active web tab counts; leaving a site open in the background does not.</p></div>}
       </>}
     </section>

@@ -17,6 +17,7 @@ import { deviceChange } from '../lib/device-store';
 import { SyncStatus } from './components/SyncStatus';
 import { Notes } from './pages/Notes';
 import { RecycleBin } from './components/RecycleBin';
+import { ResourceSearch } from './components/ResourceSearch';
 import { normalizeUrl } from '../lib/url-normalize';
 
 type NavTab = 'home' | 'library' | 'groups' | 'sessions' | 'notes' | 'time' | 'graph' | 'settings';
@@ -357,7 +358,7 @@ export const App: React.FC = () => {
       <div className="main workspace-main">
         <header className="workspace-topbar">
           <button className="icon-btn workspace-sidebar-toggle" onClick={() => setCollapsed(!collapsed)} title="Toggle navigation" aria-label="Toggle navigation" aria-expanded={!collapsed}><Icon name="sidebar" /></button>
-          <label className="search-wrap workspace-search"><Icon name="search" /><input ref={searchInputRef} className="search-bar" id="search" placeholder="Find something you saved…" aria-label="Search your resources" value={searchQuery} onChange={event => updateSearch(event.target.value)} /><kbd>/</kbd></label>
+          <ResourceSearch inputRef={searchInputRef} value={searchQuery} onChange={updateSearch} onTopic={topic=>setFilters(current=>({...current,topic}))} topic={filters.topic} pages={availablePages} enabled={activeTab==='home'||activeTab==='library'} />
           <div className="header-right workspace-top-actions">
             <button className="icon-btn" id="theme-toggle" onClick={toggleTheme} title="Switch theme" aria-label={`Switch to ${theme === 'dark' ? 'light' : 'dark'} theme`}><Icon name="theme" /></button>
             <button className="workspace-ai-button" onClick={() => setAiOpen(true)}><Icon name="sparkles" /><span>Ask Karl</span></button>

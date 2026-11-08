@@ -225,6 +225,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   let currentMode: 'library' | 'group' = 'library';
   let currentGroupSubtab: 'saved' | 'unsaved' = 'saved';
   let savedLibraryUrlSet = new Set<string>();
+  const savedLibraryTopics = new Map<string, string>();
   let savedStatusKnown=false,statusRefreshing=false;
   const pendingUrls=new Set<string>();
   const syncLine=document.createElement('div');syncLine.className='popup-sync-status';syncLine.setAttribute('role','status');
@@ -236,6 +237,8 @@ document.addEventListener('DOMContentLoaded', async () => {
     const apply=async()=>{
       const jobs=await pendingSaves();pendingUrls.clear();
       savedLibraryUrlSet=new Set(rows.map(row=>normalizeUrl(row.url_normalized||row.url_original)));
+      savedLibraryTopics.clear();
+      rows.forEach(row=>{if(row.display_topic)savedLibraryTopics.set(normalizeUrl(row.url_normalized||row.url_original),row.display_topic);});
       for(const job of jobs){
         if(job.kind==='page'||job.kind==='note'){const url=normalizeUrl(job.payload.url_original||job.payload.video_url);savedLibraryUrlSet.add(url);pendingUrls.add(url);}
         if(job.kind==='remove-page')savedLibraryUrlSet.delete(normalizeUrl(job.payload.url));
@@ -308,20 +311,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     chrome.storage.local.remove(['custom_unsaved_groups']);
   }
 
-  // 1. Health check
-  try {
-    const health = await apiClient.healthCheck();
-    if (health.status === 'ok') {
-      btnOpenDashboard.className = 'brand-mark connected';
-      btnOpenDashboard.title = `Open workspace · Backend online (v${health.version})`;
-      btnOpenDashboard.setAttribute('aria-label', 'Open workspace · Backend online');
-      await storage.setBackendStatus('connected');
-    } else {
-      setBackendOffline();
-    }
-  } catch {
-    setBackendOffline();
-  }
+  // Connection health decorates the logo; it never gates local tab controls.
+  void (async () => {
+    try {
+      const health = await apiClient.healthCheck();
+      if (health.status === 'ok') {
+        btnOpenDashboard.className = 'brand-mark connected';
+        btnOpenDashboard.title = `Open workspace · Backend online (v${health.version})`;
+        btnOpenDashboard.setAttribute('aria-label', 'Open workspace · Backend online');
+        await storage.setBackendStatus('connected');
+      } else setBackendOffline();
+    } catch { setBackendOffline(); }
+  })();
 
   function setBackendOffline() {
     btnOpenDashboard.className = 'brand-mark disconnected';
@@ -415,98 +416,37 @@ document.addEventListener('DOMContentLoaded', async () => {
     windowPicker.disabled = sorted.length < 2;
   }
 
-  // 3. Query Tabs & Tab Groups
+  // The first paint needs only one Tabs API query. All enrichment is separate.
+  let tabsRefreshRevision = 0;
+  let termConfig: TerminatorConfig = DEFAULT_TERMINATOR_CONFIG;
   async function refreshTabsFromChrome() {
+    const revision = ++tabsRefreshRevision;
+    const requestedWindow = selectedWindowId;
     try {
-      if(!savedStatusKnown){
-        const cached=await cacheForBackend<any[]>('saved-status');
-        if(cached){savedStatusKnown=true;cached.forEach(row=>savedLibraryUrlSet.add(normalizeUrl(row.url_normalized||row.url_original)));}
-        for(const job of await pendingSaves()){
-          if(job.kind==='page'||job.kind==='note')savedLibraryUrlSet.add(normalizeUrl(job.payload.url_original||job.payload.video_url));
-          if(job.kind==='remove-page')savedLibraryUrlSet.delete(normalizeUrl(job.payload.url));
-        }
-      }
+      let rawTabs: chrome.tabs.Tab[];
       try {
-        normalWindows = await chrome.windows.getAll({ windowTypes: ['normal'], populate: true });
-      } catch (winErr) {
-        console.debug('Failed to get normal windows:', winErr);
-        normalWindows = [];
+        rawTabs = await chrome.tabs.query(requestedWindow !== null ? { windowId: requestedWindow } : { currentWindow: true });
+      } catch (error) {
+        // A window closed during a switch. Resolve one real normal window,
+        // rather than combining unrelated windows into the current list.
+        const last = await chrome.windows.getLastFocused({ windowTypes: ['normal'], populate: false });
+        if (last.id === undefined) throw error;
+        rawTabs = await chrome.tabs.query({ windowId: last.id });
       }
-
-      // Determine active / selected window
-      if (normalWindows.length > 0) {
-        if (!selectedWindowId || !normalWindows.some(w => w.id === selectedWindowId)) {
-          try {
-            const lastFocused = await chrome.windows.getLastFocused({ windowTypes: ['normal'], populate: false });
-            if (lastFocused?.id && normalWindows.some(w => w.id === lastFocused.id)) {
-              selectedWindowId = lastFocused.id;
-            }
-          } catch {}
-          if (!selectedWindowId) {
-            const focusedWin = normalWindows.find(w => w.focused) || normalWindows[0];
-            selectedWindowId = focusedWin ? focusedWin.id ?? null : null;
-          }
-        }
-      } else {
-        selectedWindowId = null;
-      }
-
-      // Render Multiverse Earth Window Bar (only visible when 2+ windows)
-      renderEarthWindowBar(normalWindows);
-
-      let rawTabs: chrome.tabs.Tab[] = [];
-      try {
-        if (selectedWindowId) {
-          rawTabs = await chrome.tabs.query({ windowId: selectedWindowId });
-        } else {
-          rawTabs = await chrome.tabs.query({ currentWindow: true });
-        }
-        if (rawTabs.length === 0) {
-          const lastWin = await chrome.windows.getLastFocused({ populate: false });
-          if (lastWin?.id) {
-            rawTabs = await chrome.tabs.query({ windowId: lastWin.id });
-          }
-        }
-      } catch {}
-      if (rawTabs.length === 0) {
-        rawTabs = await chrome.tabs.query({});
-      }
-
-      try {
-        if (selectedWindowId) {
-          allGroups = await chrome.tabGroups.query({ windowId: selectedWindowId });
-        } else {
-          allGroups = await chrome.tabGroups.query({ windowId: chrome.windows.WINDOW_ID_CURRENT });
-        }
-        if (allGroups.length === 0) {
-          allGroups = await chrome.tabGroups.query({});
-        }
-      } catch {
-        allGroups = await chrome.tabGroups.query({});
+      if (revision !== tabsRefreshRevision) return;
+      selectedWindowId = rawTabs[0]?.windowId ?? requestedWindow;
+      if (!normalWindows.length && selectedWindowId !== null) {
+        normalWindows = [{ id: selectedWindowId, focused: true, type: 'normal', incognito: !!rawTabs[0]?.incognito, alwaysOnTop: false }];
+        renderEarthWindowBar(normalWindows);
       }
       loading.style.display = 'none';
 
-      // Compute Terminator clutter (Duplicates, New Tabs, Custom Target list)
-      let termConfig: TerminatorConfig = DEFAULT_TERMINATOR_CONFIG;
-      try {
-        const storedConfig = await storage.get<TerminatorConfig>('terminator_config');
-        if (storedConfig) {
-          termConfig = storedConfig;
-        } else {
-          void apiClient.get<TerminatorConfig>('/api/terminator/rules').then(config=>storage.set('terminator_config',config)).catch(()=>{});
-
-        }
-      } catch {
-        // fallback to default
-      }
-
       const savedUrlSet=new Set(savedLibraryUrlSet);
-      const savedTopics=new Map<string,string>();
       const urlCountMap = new Map<string, number>();
       allOpenTabs = rawTabs.map(t => {
         const norm = normalizeUrl(t.url || '');
         urlCountMap.set(norm, (urlCountMap.get(norm) || 0) + 1);
-        return { ...t, normalizedUrl: norm, savedTopic: savedTopics.get(norm) };
+        return { ...t, normalizedUrl: norm, savedTopic: savedLibraryTopics.get(norm), pendingSave: pendingUrls.has(norm) };
       });
 
       let excessDuplicateCopies = 0;
@@ -565,6 +505,7 @@ document.addEventListener('DOMContentLoaded', async () => {
       totalCountSpan.textContent = String(allOpenTabs.length);
       renderTabs();
       updateSelectionUI();
+      void refreshChromeMetadata(selectedWindowId, revision);
       if (companionReady) {
         updateCompanionBadges();
         if (companionNotesModal.style.display === 'flex') renderCompanionNotesList();
@@ -576,7 +517,36 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
   }
 
+  async function refreshChromeMetadata(windowId: number | null, revision: number) {
+    // Window picker and group labels do not need to delay the Open tabs list.
+    await Promise.allSettled([
+      chrome.windows.getAll({ windowTypes: ['normal'], populate: false }).then(windows => {
+        if (revision !== tabsRefreshRevision) return;
+        normalWindows = windows;
+        renderEarthWindowBar(normalWindows);
+      }),
+      chrome.tabGroups.query({ windowId: windowId ?? chrome.windows.WINDOW_ID_CURRENT }).then(groups => {
+        if (revision !== tabsRefreshRevision) return;
+        allGroups = groups;
+        updateGroupBadges();
+        if (currentMode === 'group') { renderTabs(); updateSelectionUI(); }
+      }),
+    ]);
+  }
+
   await refreshTabsFromChrome();
+  // Local preferences are optional enrichment too. A blocked storage request
+  // must not hide live tabs or prevent click handlers from being installed.
+  void storage.get<TerminatorConfig>('terminator_config').then(config => {
+    if (config) {
+      termConfig = config;
+      void refreshTabsFromChrome();
+    } else {
+      void apiClient.get<TerminatorConfig>('/api/terminator/rules')
+        .then(value => { termConfig = value; void refreshTabsFromChrome(); return storage.set('terminator_config', value); })
+        .catch(() => {});
+    }
+  }).catch(() => {});
   const receiveWakeProgress = (message: { type?: string; progress?: WakeProgress }) => {
     if (message.type !== 'TAB_WAKE_PROGRESS' || !message.progress || (message.progress.ownerId === wakeProgress?.ownerId && message.progress.revision < (wakeProgress?.revision ?? 0))) return;
     const wasRunning = !!wakeProgress?.running || wakeStarting;

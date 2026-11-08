@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { PageCard } from '../components/PageCard';
 import { apiClient } from '../../lib/api-client';
 import { PageData } from '../../types';
-import { LibraryFilters, emptyFilters, pageTopics } from '../../lib/page-filters';
+import { LibraryFilters, emptyFilters } from '../../lib/page-filters';
 import { VirtualPageGrid } from '../components/VirtualPageGrid';
 import { SessionRecovery } from '../components/SessionRecovery';
 
@@ -97,7 +97,6 @@ export const Library: React.FC<LibraryProps> = ({
 
   // Derive domains and topics
   const domainCounts = new Map<string, number>();
-  const topicCounts = new Map<string, number>();
 
 
 
@@ -109,14 +108,8 @@ export const Library: React.FC<LibraryProps> = ({
     })() : '');
     if (domain) domainCounts.set(domain, (domainCounts.get(domain) || 0) + 1);
 
-    pageTopics(p).forEach(topic => {
-      topicCounts.set(topic, (topicCounts.get(topic) || 0) + 1);
-    });
   });
 
-  const topTopics = Array.from(topicCounts.entries())
-    .sort((a, b) => b[1] - a[1])
-    .map(([topic, count]) => ({ topic, count }));
 
   const topDomains = Array.from(domainCounts.entries())
     .sort((a, b) => b[1] - a[1])
@@ -143,7 +136,6 @@ export const Library: React.FC<LibraryProps> = ({
           {([['hasNotes','Has notes'],['important','Important'],['urgent','Urgent']] as const).map(([key,label])=><button key={key} className={`pill ${filters[key]?'active':''}`} aria-pressed={filters[key]} onClick={()=>setFilters(current=>({...current,[key]:!current[key]}))}>{label}</button>)}
         </div>
         <div className="library-toolbar-actions">
-          <label className="library-topic-filter"><span className="sr-only">Filter by topic</span><select aria-label="Filter by topic" value={filters.topic} onChange={event=>setFilters(current=>({...current,topic:event.target.value}))}><option value="">All topics</option>{topTopics.map(({topic,count})=><option key={topic} value={topic}>{topic} ({count})</option>)}</select></label>
           <label className="library-domain-filter"><select aria-label="Filter by website" value={filters.domain} onChange={event=>setFilters(current=>({...current,domain:event.target.value}))}><option value="">All websites</option>{topDomains.map(({domain,count})=><option key={domain} value={domain}>{domain} ({count})</option>)}</select></label>
           <button className="pill library-view-toggle" aria-pressed={grouped}
             title={grouped ? 'Show all resources together' : 'Arrange resources by topic'}

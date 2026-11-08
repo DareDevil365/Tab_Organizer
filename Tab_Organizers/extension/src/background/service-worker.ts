@@ -4,7 +4,7 @@ import { flushSaves, saveOnDevice } from '../lib/outbox';
 import { normalizeUrl } from '../lib/url-normalize';
 import { ActivityTracker, TrackingContext } from '../lib/activity-tracker';
 import { TabWakeManager } from '../lib/wake-tabs';
-import { openFloatingPanel, authorizeFloatingPanel, floatingSessionKey } from '../lib/floating-panel';
+import { openFloatingPanel, authorizeFloatingPanel, floatingSessionKey, closeInactivePanels } from '../lib/floating-panel';
 import {
   getNextContrastingGroupColor,
   markGroupColorUsed,
@@ -205,6 +205,25 @@ async function checkBackendHealth() {
 }
 
 // 3. Time tracking: focused active web tab only, with durable 30-second checkpoints.
+// Read only public watch-page metadata, never notes, transcripts or page bodies.
+function readActivityVideoContext() {
+  const title = document.querySelector('ytd-watch-metadata h1, h1.title yt-formatted-string')?.textContent?.trim() || document.title;
+  const channel = document.querySelector('ytd-watch-metadata #channel-name a, ytd-video-owner-renderer #channel-name a')?.textContent?.trim() || '';
+  return { url: location.href, title: title.slice(0, 500), channel: channel.slice(0, 200) };
+}
+const activityVideoContext = new Map<number, { url: string; title?: string; channel?: string }>();
+const activityVideoReads = new Map<number, string>();
+function captureActivityVideo(tab: chrome.tabs.Tab) {
+  if (tab.id === undefined || !tab.url || !/^https:\/\/(?:www\.|m\.)?youtube\.com\/(?:watch|shorts|live)/i.test(tab.url)) return;
+  const id=tab.id, url=tab.url;
+  if(activityVideoContext.get(id)?.url===url || activityVideoReads.get(id)===url)return;
+  activityVideoReads.set(id,url);
+  void chrome.scripting.executeScript({target:{tabId:id},func:readActivityVideoContext}).then(result=>{
+    const value=result[0]?.result;
+    if(value?.url===url)activityVideoContext.set(id,value);
+  }).catch(()=>{}).finally(()=>{if(activityVideoReads.get(id)===url)activityVideoReads.delete(id);});
+}
+chrome.tabs.onRemoved.addListener(id=>{activityVideoContext.delete(id);activityVideoReads.delete(id);});
 async function getTrackingContext(): Promise<TrackingContext | null> {
   try {
     const idleState = await new Promise<chrome.idle.IdleState>(resolve => chrome.idle.queryState(60, resolve));
@@ -213,7 +232,10 @@ async function getTrackingContext(): Promise<TrackingContext | null> {
     if (!win.focused || win.id === undefined || win.state === 'minimized') return null;
     const [tab] = await chrome.tabs.query({ active: true, windowId: win.id });
     if (!tab?.id || !tab.url || !/^https?:\/\//i.test(tab.url)) return null;
-    return { tabId: tab.id, url: tab.url, domain: new URL(tab.url).hostname.replace(/^www\./i, '') };
+    captureActivityVideo(tab);
+    const video=activityVideoContext.get(tab.id);
+    return { tabId: tab.id, url: tab.url, domain: new URL(tab.url).hostname.replace(/^www\./i, ''),
+      title:video?.url===tab.url?video.title:tab.title, channel:video?.url===tab.url?video.channel:undefined };
   } catch { return null; }
 }
 
@@ -222,12 +244,18 @@ const activityTracker = new ActivityTracker({
   context: getTrackingContext,
   read: () => chrome.storage.local.get(['activity_queue', 'activity_current_session_v2']),
   write: state => chrome.storage.local.set(state),
-  upload: activities => apiClient.post('/api/activity', { activities }),
+  upload: async activities => {
+    const response=await apiClient.post<{recorded:number;classification_pending?:boolean}>('/api/activity', { activities });
+    // Classification is a separate request: committing time never waits on AI.
+    if(response.classification_pending)void apiClient.post('/api/activity/classify', {limit:20}).catch(()=>{});
+    return response;
+  },
 });
 chrome.idle.setDetectionInterval(60);
 const checkpointActivity = () => activityTracker.checkpoint().catch(error => console.debug('Activity checkpoint deferred:', error));
 
 chrome.tabs.onActivated.addListener(async activeInfo => {
+  void closeInactivePanels(activeInfo.tabId,activeInfo.windowId).catch(()=>{});
   try {
     const win = await chrome.windows.get(activeInfo.windowId);
     if (win.focused) await checkpointActivity();
@@ -235,6 +263,7 @@ chrome.tabs.onActivated.addListener(async activeInfo => {
   debouncedSnapshot();
 });
 chrome.tabs.onUpdated.addListener(async (tabId, changeInfo) => {
+  if (changeInfo.url || changeInfo.title) activityVideoContext.delete(tabId);
   if (changeInfo.url) {
     try {
       const tab = await chrome.tabs.get(tabId);

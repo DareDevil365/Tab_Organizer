@@ -4,7 +4,7 @@ import test from 'node:test';
 import ts from 'typescript';
 const source=readFileSync(new URL('../src/lib/page-filters.ts',import.meta.url),'utf8');
 const javascript=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2022}}).outputText;
-const {applyLibraryFilters,emptyFilters}=await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`);
+const {applyLibraryFilters,emptyFilters,pageTopics}=await import(`data:text/javascript;base64,${Buffer.from(javascript).toString('base64')}`);
 test('topic, website, notes, completion and priority intersect without dropping earlier choices',()=>{
   const pages=[{id:1,domain:'youtube.com',subject_topics:['AI'],note_count:2,is_important:true},
     {id:2,domain:'youtube.com',subject_topics:['AI'],note_count:0,is_important:true},
@@ -15,4 +15,11 @@ test('topic, website, notes, completion and priority intersect without dropping 
   assert.deepEqual(applyLibraryFilters(pages,{...filters,status:'completed'}).map(page=>page.id),[4]);
   assert.equal(applyLibraryFilters(pages,emptyFilters).length,4);
   assert.equal(filters.hasNotes,true);
+});
+
+test('new generated categories preserve older saved categories and deduplicate their counts',()=>{
+ const page={topic:'Academics & Science',display_topic:'Mathematics',subject_topics:['Learning','Mathematics',' mathematics ','youtube.com','Other']};
+ assert.deepEqual(pageTopics(page),['Learning','Mathematics','Academics & Science']);
+ assert.equal(applyLibraryFilters([page],{...emptyFilters,topic:'Academics & Science'}).length,1);
+ assert.equal(applyLibraryFilters([page],{...emptyFilters,topic:'Mathematics'}).length,1);
 });

@@ -4,7 +4,7 @@ import test from 'node:test';
 import ts from 'typescript';
 const source=readFileSync(new URL('../src/lib/floating-panel.ts',import.meta.url),'utf8');
 const js=ts.transpileModule(source,{compilerOptions:{module:ts.ModuleKind.ESNext,target:ts.ScriptTarget.ES2020}}).outputText;
-const {openFloatingPanel,authorizeFloatingPanel}=await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
+const {openFloatingPanel,authorizeFloatingPanel,closeInactivePanels}=await import(`data:text/javascript;base64,${Buffer.from(js).toString('base64')}`);
 function fixture(result='opened') {
  const data={},calls=[];
  globalThis.chrome={runtime:{id:'test',getURL:p=>`chrome-extension://test/${p}`},storage:{session:{set:async value=>Object.assign(data,value),get:async key=>({[key]:data[key]}),remove:async key=>delete data[key]}},scripting:{executeScript:async options=>{calls.push(['inject',options]);if(result==='throw')throw Error('Restricted');return[{result}];}},action:{setPopup:async value=>calls.push(['popup',value.popup]),openPopup:async options=>calls.push(options?['native',options.windowId]:['native'])}};
@@ -82,4 +82,34 @@ test('only the correct extension frame in the matching tab can initialize the co
  assert.equal(await authorizeFloatingPanel(token,{...sender,url:'https://example.com'}),false);
  f.data.karlx_panel_7.createdAt=Date.now()-13*3600000;
  assert.equal(await authorizeFloatingPanel(token,sender),false);
+});
+
+test('tab switching closes the old floating panel, retaining panels in other browser windows',async()=>{
+ const f=fixture();
+ f.data.karlx_panel_7={token:'old'};f.data.karlx_panel_8={token:'current'};f.data.karlx_panel_9={token:'other-window'};
+ chrome.storage.session.get=async key=>key===null?{...f.data}:{[key]:f.data[key]};
+ chrome.tabs={get:async id=>({id,windowId:id===9?2:1,url:'https://example.com',discarded:false})};
+ await closeInactivePanels(8,1);
+ assert.equal(f.calls.filter(call=>call[0]==='inject').length,1);
+ assert.equal(f.calls[0][1].target.tabId,7);
+ assert.equal(f.data.karlx_panel_7,undefined);
+ assert.ok(f.data.karlx_panel_8&&f.data.karlx_panel_9);
+});
+
+test('switching away from a dashboard panel uses its close message, never script injection',async()=>{
+ const f=fixture();f.data.karlx_panel_7={token:'dashboard'};
+ chrome.storage.session.get=async()=>({...f.data});
+ chrome.tabs={get:async()=>({id:7,windowId:1,url:'chrome-extension://test/src/dashboard/dashboard.html'})};
+ chrome.runtime.sendMessage=async message=>{f.calls.push(['message',message]);return{closed:true};};
+ await closeInactivePanels(8,1);
+ assert.deepEqual(f.calls,[['message',{type:'CLOSE_WORKSPACE_PANEL',tabId:7}]]);
+ assert.equal(f.data.karlx_panel_7,undefined);
+});
+
+test('discarded tabs are not woken merely to close a panel that no longer exists',async()=>{
+ const f=fixture();f.data.karlx_panel_7={token:'old'};
+ chrome.storage.session.get=async()=>({...f.data});
+ chrome.tabs={get:async()=>({id:7,windowId:1,url:'https://example.com',discarded:true})};
+ await closeInactivePanels(8,1);
+ assert.deepEqual(f.calls,[]);assert.equal(f.data.karlx_panel_7,undefined);
 });

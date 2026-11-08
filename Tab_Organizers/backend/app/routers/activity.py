@@ -11,6 +11,7 @@ from app.models.activity import ActivityLog
 from app.models.page import Page
 from app.schemas.activity import (
     ActivityBatchCreate,
+    ActivityClassifyRequest,
     ActivitySummary,
     DomainUsage,
     TopicUsage,
@@ -18,8 +19,14 @@ from app.schemas.activity import (
 )
 from app.services.url_normalizer import normalize_url
 from app.services.completion import completion_kind
+from app.services.activity_subjects import remember_activity_content, activity_topic_map, classify_activity_subjects
 
 router = APIRouter(prefix="/api/activity", tags=["activity"])
+
+
+@router.post('/classify')
+async def classify_browsing(payload: ActivityClassifyRequest, db: AsyncSession = Depends(get_db)):
+    return await classify_activity_subjects(db, payload.limit)
 
 
 @router.get('/completions')
@@ -64,6 +71,7 @@ async def record_activities(payload: ActivityBatchCreate, db: AsyncSession = Dep
     ))).scalars().all()
     seen = {(item.url, utc_naive(item.started_at), utc_naive(item.ended_at), item.duration_seconds) for item in existing}
     records = []
+    await remember_activity_content(db, payload.activities)
     for item in payload.activities:
         start, end = utc_naive(item.started_at), utc_naive(item.ended_at)
         key = (item.url, start, end, item.duration_seconds)
@@ -90,10 +98,10 @@ async def record_activities(payload: ActivityBatchCreate, db: AsyncSession = Dep
 
     db.add_all(records)
     await db.commit()
-    return {"recorded": len(records)}
+    return {"recorded": len(records), "classification_pending": any((row.topic or 'other').casefold() == 'other' for row in records)}
 
 
-def summarize_activity(logs, days: int, now: datetime.datetime, utc_offset_minutes: int = 0) -> ActivitySummary:
+def summarize_activity(logs, days: int, now: datetime.datetime, utc_offset_minutes: int = 0, topics=None) -> ActivitySummary:
     """Clip rolling-window intervals and split time across the browser's local dates.
 
     Offset uses ISO convention: +330 means UTC+05:30 (the browser sends
@@ -122,7 +130,7 @@ def summarize_activity(logs, days: int, now: datetime.datetime, utc_offset_minut
         except ValueError:
             domain = log.domain or 'unknown'
         domain = domain.lower().removeprefix('www.')
-        topic = log.topic or 'other'
+        topic = (topics or {}).get(normalize_url(log.url)) or log.topic or 'other'
         domain_totals[domain] += seconds
         topic_totals[topic] += seconds
         website_topics[domain][topic] += seconds
@@ -142,8 +150,18 @@ def summarize_activity(logs, days: int, now: datetime.datetime, utc_offset_minut
     domain_breakdown = [DomainUsage(domain=domain, duration_seconds=seconds,
         percentage=round(seconds / total_seconds * 100, 1) if total_seconds else 0,
         topic=max(website_topics[domain], key=website_topics[domain].get)) for domain, seconds in sorted_domains]
+    # Headings follow actual recent time, not a fixed saved-page taxonomy.
+    # Keep smaller interests expandable without losing any recorded seconds.
+    ranked_known = [(topic, seconds) for topic, seconds in sorted_topics if topic.casefold() != 'other']
+    minimum = max(30, total_seconds * .005)
+    visible_known = {topic for index, (topic, seconds) in enumerate(ranked_known) if index < 3 or (index < 8 and seconds >= minimum)}
+    visible_topics = [(topic, seconds) for topic, seconds in sorted_topics if topic in visible_known or topic.casefold() == 'other']
     topic_breakdown = [TopicUsage(topic=topic, duration_seconds=seconds,
-        percentage=round(seconds / total_seconds * 100, 1) if total_seconds else 0) for topic, seconds in sorted_topics[:10]]
+        percentage=round(seconds / total_seconds * 100, 1) if total_seconds else 0) for topic, seconds in visible_topics]
+    remaining = sum(seconds for topic, seconds in sorted_topics if topic not in visible_known and topic.casefold() != 'other')
+    if remaining:
+        topic_breakdown.append(TopicUsage(topic='Other subjects', duration_seconds=remaining,
+            percentage=round(remaining / total_seconds * 100, 1)))
     first, last = cutoff.astimezone(zone).date(), now.astimezone(zone).date()
     trends = []
     while first <= last:
@@ -167,7 +185,8 @@ async def get_activity_summary(
     cutoff = now - datetime.timedelta(days=days)
     stmt = select(ActivityLog).where(ActivityLog.ended_at > cutoff, ActivityLog.started_at < now)
     logs = (await db.execute(stmt)).scalars().all()
-    return summarize_activity(logs, days, now, utc_offset_minutes)
+    topics = await activity_topic_map(db, {log.url for log in logs})
+    return summarize_activity(logs, days, now, utc_offset_minutes, topics)
 
 
 @router.get("/by-domain", response_model=List[DomainUsage])

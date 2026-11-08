@@ -38,6 +38,7 @@ export async function mountFloatingPanel(popupUrl: string, token: string): Promi
     document.removeEventListener('pointerdown', outside, true);
     document.removeEventListener('keydown', escape, true);
     document.removeEventListener('visibilitychange', visibility);
+    window.removeEventListener('pagehide', close);
     window.removeEventListener('message', message);
     if (!reduced && !document.hidden && host.isConnected) {
       host.getAnimations().forEach(animation => animation.cancel());
@@ -62,12 +63,42 @@ export async function mountFloatingPanel(popupUrl: string, token: string): Promi
   document.addEventListener('pointerdown', outside, true);
   document.addEventListener('keydown', escape, true);
   document.addEventListener('visibilitychange', visibility);
+  window.addEventListener('pagehide', close);
   window.addEventListener('message', message);
   timer = setTimeout(() => { resolveReady('unavailable'); close(); }, 4000);
   return ready;
 }
 
 export const floatingSessionKey = (tabId: number) => `karlx_panel_${tabId}`;
+
+/** Browser activation events close panels even if the old page is throttled. */
+export async function closeInactivePanels(activeTabId: number, windowId: number): Promise<void> {
+  const state=await chrome.storage.session.get(null);
+  await Promise.allSettled(Object.keys(state).filter(key=>/^karlx_panel_\d+$/.test(key)).map(async key=>{
+    const tabId=Number(key.slice('karlx_panel_'.length));
+    if(tabId===activeTabId)return;
+    try {
+      const tab=await chrome.tabs.get(tabId);
+      if(tab.active||tab.windowId!==windowId)return;
+      if((tab.url||'').split(/[?#]/)[0]===chrome.runtime.getURL('src/dashboard/dashboard.html')) {
+        await chrome.runtime.sendMessage({type:'CLOSE_WORKSPACE_PANEL',tabId});
+      } else if(!tab.discarded) {
+        await chrome.scripting.executeScript({target:{tabId},func:()=>{
+          document.getElementById('karlx-floating-panel')?.dispatchEvent(new Event('karlx-dismiss'));
+        }});
+      }
+      await chrome.storage.session.remove(key);
+    } catch { /* A closed or navigated tab already lost its panel. */ }
+  }));
+  const detached=state.karlx_detached_panel;
+  if(detached?.sourceWindowId===windowId&&detached.sourceTabId!==undefined&&detached.sourceTabId!==activeTabId){
+    try {
+      const window=await chrome.windows.get(detached.id,{populate:true});
+      if(window.type==='popup'&&window.tabs?.some(tab=>(tab.url||'').split('?')[0]===chrome.runtime.getURL('src/popup/popup.html')))await chrome.windows.remove(detached.id);
+      await chrome.storage.session.remove('karlx_detached_panel');
+    }catch{/* Already closed. */}
+  }
+}
 
 export async function openFloatingPanel(tab: chrome.tabs.Tab): Promise<void> {
   const path = 'src/popup/popup.html';
@@ -118,7 +149,7 @@ export async function openFloatingPanel(tab: chrome.tabs.Tab): Promise<void> {
       // Let the window manager place the same panel on a visible display.
       opened=await chrome.windows.create(options);
     }
-    if(opened.id!==undefined)await chrome.storage.session.set({[key]:{id:opened.id}});
+    if(opened.id!==undefined)await chrome.storage.session.set({[key]:{id:opened.id,sourceWindowId:source.id,sourceTabId:tab.id}});
     return;
   }catch{/* Last-resort native popup if the window manager cannot create a panel. */}
   await chrome.action.setPopup({ popup: path });
