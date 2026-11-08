@@ -167,3 +167,41 @@ async def test_query_embeddings_also_exclude_pasted_addresses(monkeypatch):
         results = await brain_service.search_relevant_pages('Explain transformers at https://example.ai/attention', db)
     assert queries == ['Explain transformers at']
     assert results[0]['url'] == 'https://example.ai/attention'
+
+
+@pytest.mark.parametrize('title', ['FreeCAD 1.1 is a GAME CHANGER', 'Steam turbine engineering'])
+def test_rag_and_subjects_never_recycle_old_labels_or_generated_tags(title):
+    from app.services.content_subjects import library_subjects
+    from app.services.topic_discovery import content_document
+    page={'id':1,'title':title,'description':'Designing mechanical parts', 'full_text':'Engineering measurements',
+          'topic':'Gaming','category':'Gaming folder','tags':'minecraft, gameplay, gaming','notes':'Buy groceries',
+          'url_original':'https://gaming.example/video'}
+    baseline={**page,'topic':None,'category':None,'tags':None,'notes':None}
+    assert semantic_content(page)==semantic_content(baseline)
+    assert content_document(page)==content_document(baseline)
+    assert library_subjects(page)==library_subjects(baseline)
+    assert 'Gaming' not in library_subjects(page)
+    assert 'Engineering measurements' in semantic_content(page)
+
+
+@pytest.mark.asyncio
+async def test_save_paths_do_not_persist_automatic_keyword_guesses(monkeypatch):
+    from app.config import settings
+    from app.routers import pages
+    monkeypatch.setattr(settings,'APP_MODE','cloud')
+    monkeypatch.setattr(settings,'BACKEND_API_KEY','isolated-classification-fixture')
+    async def title(url,value):return value
+    monkeypatch.setattr(pages,'resolve_video_title',title)
+    async with AsyncClient(transport=ASGITransport(app=app),base_url='http://test',headers={'Authorization':'Bearer isolated-classification-fixture'}) as client:
+        saved=await client.post('/api/pages',json={'url_original':'https://fixture.test/cad','url_normalized':'https://fixture.test/cad',
+            'title':'FreeCAD GAME CHANGER Minecraft gameplay comparison'})
+        assert saved.status_code==200
+        assert saved.json()['topic'] is None and not saved.json()['tags']
+        bulk=await client.post('/api/pages/save-bulk',json={'tabs':[{'url_original':'https://fixture.test/explicit','url_normalized':'https://fixture.test/explicit',
+            'title':'Steam gameplay', 'topic':'Engineering'}]})
+        assert bulk.status_code==200
+    async with database.async_session_maker() as db:
+        rows=(await db.execute(select(Page))).scalars().all()
+        assert len(rows)==2
+        assert rows[0].topic is None and not rows[0].tags
+        assert rows[1].topic=='Engineering' and not rows[1].tags

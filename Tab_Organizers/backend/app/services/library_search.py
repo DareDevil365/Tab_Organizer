@@ -115,6 +115,6 @@ async def search_library(db, query):
         if page_id is not None:
             by_page.setdefault(page_id, []).append(clean_content(comment or ''))
     documents = [{'id': page.id, 'title': clean_content(page.title or ''), 'url': page.url_original,
-                  'text': '\n'.join([semantic_content(page), clean_content((page.full_text or '')[:6000]),
+                  'text': '\n'.join([semantic_content(page),
                                      '\n'.join(by_page.get(page.id, []))[:6000]])} for page in pages]
     return await asyncio.to_thread(rank_documents, documents, query)

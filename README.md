@@ -16,10 +16,15 @@ If it asks you to keep the panel open, leave it open until waking finishes.
 Open tabs load directly from the browser while connection and saved-status
 checks run separately. Floating panels close when you switch tabs.
 
-Focus the Library search box to choose from colored category pills. Existing
-saved categories stay available alongside generated subjects. Typing switches
+Focus the Library search box to choose from colored category pills. Categories
+follow content-derived subjects; stale keyword labels cannot override them. Typing switches
 to saved-title suggestions, including partial words and common typos; Enter
 without selecting a suggestion keeps the normal resource search.
+
+Topic generation interprets titles and descriptions together. Graph discovery
+and RAG embeddings exclude saved classification guesses, suggested tags, URLs
+and companion notes as subject evidence. Saving never waits for classification.
+If contextual AI is unavailable, weak keyword matches remain unclassified.
 
 Activity subjects use recorded page titles and video channels, including unsaved
 videos. Headings reflect the selected time period, with small interests grouped

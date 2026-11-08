@@ -8,13 +8,9 @@ from sqlalchemy import select, func, or_
 
 from app.models.page import Page
 from app.services.state_store import read_json, write_json
+from app.services.content_subjects import clean_content
 from app.services.ai_provider import (
     get_ai_provider,
-    AIProvider,
-    OpenRouterProvider,
-    GeminiProvider,
-    GroqProvider,
-    OllamaProvider
 )
 
 logger = logging.getLogger(__name__)
@@ -295,34 +291,42 @@ def save_taxonomy(taxonomy: List[str]) -> None:
     save_taxonomy_rules(new_rules)
 
 
+_FIGURATIVE_GAME = re.compile(
+    r'\bgame[\s\-–—]+chang(?:ers?|ing)\b|'
+    r'\bchang(?:e[sd]?|ing)[\s\-–—]+(?:the|your|our)[\s\-–—]+game\b|'
+    r'\bgame[\s\-–—]+(?:theory|of[\s\-–—]+thrones)\b|'
+    r'\b(?:blame|numbers|zero[\s-]sum)[\s\-–—]+game\b', re.I)
+
+
+def _rule_evidence(text: str, rule: Dict[str, Any]) -> str:
+    """An idiom is not evidence about video games; other subjects retain it."""
+    name = str(rule.get('name') or rule.get('slug') or '')
+    if re.search(r'\bgaming\b|\bvideo games?\b', name, re.I):
+        return _FIGURATIVE_GAME.sub(' ', text)
+    return text
+
+
 def classify_by_rules(
     item: Dict[str, Any],
     rules: Optional[List[Dict[str, Any]]] = None
 ) -> Optional[str]:
     """
-    Evaluates title, URL, description, domain, and tags against keyword and description rules.
-    Returns the matching rule's name if a strong match is detected.
+    Conservative offline fallback. Addresses, old labels and suggested tags are
+    not content. A single keyword cannot settle an ambiguous subject.
     """
     if rules is None:
         rules = load_taxonomy_rules()
 
-    title = (item.get("title") or "").lower()
-    description = (item.get("description") or "").lower()
-    url = (item.get("url") or item.get("url_original") or "").lower()
-    domain = (item.get("domain") or "").lower()
-    tags = (item.get("tags") or "").lower()
-
-    text_corpus = f"{title} {description} {url} {domain} {tags}"
-
-    best_topic = None
-    best_score = 0.0
+    title = clean_content(item.get("title") or "").lower()
+    description = clean_content(item.get("description") or "").lower()
+    candidates = []
 
     for rule in rules:
         topic_name = rule.get("name") or rule.get("slug")
         keywords = rule.get("keywords") or []
-        rule_desc = rule.get("description") or ""
-
         score = 0.0
+        matched = set()
+        rule_title, rule_description = (_rule_evidence(text, rule) for text in (title, description))
 
         for kw in keywords:
             kw_clean = kw.strip().lower()
@@ -332,73 +336,51 @@ def classify_by_rules(
             # Word boundary regex pattern with optional plural 's'
             pattern = r'(?:\b|[\s/_.-])' + re.escape(kw_clean) + r's?(?:\b|[\s/_.-])'
 
-            if re.search(pattern, title):
+            if re.search(pattern, rule_title):
                 score += 3.5
-            if re.search(pattern, domain) or re.search(pattern, url):
-                score += 3.0
-            if re.search(pattern, description):
+                matched.add(kw_clean)
+            if re.search(pattern, rule_description):
                 score += 2.0
-            if re.search(pattern, tags):
-                score += 2.5
-
-        if score > best_score and score >= 2.0:
-            best_score = score
-            best_topic = topic_name
-
-    return best_topic
+                matched.add(kw_clean)
+        # Repeated occurrences, nested keywords and the same word in multiple
+        # fields do not constitute independent corroborating evidence.
+        independent = [kw for kw in matched if not any(kw != other and re.search(r'\b'+re.escape(kw)+r'\b', other) for other in matched)]
+        if topic_name and len(independent) >= 2:
+            candidates.append((score, topic_name))
+    candidates.sort(key=lambda candidate: -candidate[0])
+    if not candidates or (len(candidates)>1 and candidates[0][0]-candidates[1][0]<2):
+        return None
+    return candidates[0][1]
 
 
 async def classify_pages_batch_with_fallback(
     items: List[Dict[str, Any]],
     taxonomy: List[str]
 ) -> List[Dict[str, Any]]:
+    """Contextual AI is authoritative; keyword rules only cover unavailable AI.
+
+    Every item reaches the configured provider, including those with keyword
+    matches. Keep provider failures and partial responses from losing records.
     """
-    Combines high-speed rule-based classification with LLM fallback chain.
-    """
+    if not items:
+        return []
     rules = load_taxonomy_rules()
-    results = []
-    unclassified_items = []
-
-    # 1. Rule-based pre-pass
-    for item in items:
-        matched = classify_by_rules(item, rules)
-        if matched:
-            results.append({"id": item["id"], "topic": matched})
-        else:
-            unclassified_items.append(item)
-
-    if not unclassified_items:
-        return results
-
-    # 2. LLM fallback for remaining ambiguous items
-    providers: List[AIProvider] = []
+    content_items = [{'id':item['id'], 'title':clean_content(item.get('title') or ''),
+        'description':clean_content(' '.join(str(item.get(field) or '') for field in ('description','content_summary','full_text')))[:1800]}
+        for item in items]
+    classified = {}
+    allowed = {topic.casefold():topic for topic in taxonomy}
+    item_ids = {item['id'] for item in items}
     try:
-        primary = await get_ai_provider()
-        providers.append(primary)
-    except Exception as e:
-        logger.warning(f"Could not initialize primary AI provider: {e}")
-
-    for candidate in [OpenRouterProvider(), GeminiProvider(), GroqProvider(), OllamaProvider()]:
-        if not any(type(candidate) is type(p) for p in providers):
-            providers.append(candidate)
-
-    llm_results = None
-    for provider in providers:
-        try:
-            res = await provider.classify_batch(unclassified_items, taxonomy)
-            if res:
-                llm_results = res
-                break
-        except Exception as e:
-            logger.warning(f"Classification failed with {provider.__class__.__name__}: {e}")
-
-    if llm_results:
-        results.extend(llm_results)
-    else:
-        for item in unclassified_items:
-            results.append({"id": item["id"], "topic": "other"})
-
-    return results
+        provider = await get_ai_provider()
+        for row in await provider.classify_batch(content_items, taxonomy):
+            if not isinstance(row,dict): continue
+            topic = allowed.get(str(row.get('topic') or '').casefold())
+            if row.get('id') in item_ids and topic:
+                classified[row['id']] = topic
+    except Exception:
+        logger.warning('Contextual classification unavailable; using conservative content fallback')
+    return [{'id':item['id'], 'topic':classified.get(item['id']) or classify_by_rules(item,rules) or 'other'} for item in content_items]
 
 
 async def run_batch_classification(
@@ -489,12 +471,13 @@ def suggest_page_tags(page_data: Dict[str, Any]) -> List[str]:
     matched_kws = []
 
     for rule in rules:
+        rule_text = _rule_evidence(text, rule)
         for kw in rule.get("keywords") or []:
             kw_clean = kw.strip().lower()
             if len(kw_clean) < 3:
                 continue
             pattern = r'(?:\b|[\s/_.-])' + re.escape(kw_clean) + r's?(?:\b|[\s/_.-])'
-            if re.search(pattern, text):
+            if re.search(pattern, rule_text):
                 matched_kws.append(kw_clean)
 
     return list(dict.fromkeys(matched_kws))[:5]

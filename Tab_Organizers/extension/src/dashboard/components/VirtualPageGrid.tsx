@@ -1,12 +1,13 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { PageData } from '../../types';
+import { pageTopics } from '../../lib/page-filters';
 interface Props {pages:PageData[];grouped:boolean;render:(page:PageData)=>React.ReactNode}
 export function VirtualPageGrid({pages,grouped,render}:Props){
   const host=useRef<HTMLDivElement>(null),[width,setWidth]=useState(1000),[viewport,setViewport]=useState({top:0,bottom:1000});
   const columns=Math.max(1,Math.floor((width+24)/264)),cardHeight=Math.ceil((width-24*(columns-1))/columns*10/16)+118;
   const rows=useMemo(()=>{
     const groups=new Map<string,PageData[]>();
-    pages.forEach(page=>{const key=grouped?(page.display_topic||page.topic||'Other saves'):'';if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(page);});
+    pages.forEach(page=>{const key=grouped?(page.display_topic||pageTopics(page).slice(-1)[0]||'Other saves'):'';if(!groups.has(key))groups.set(key,[]);groups.get(key)!.push(page);});
     const result:{key:string;top:number;height:number;title?:string;pages?:PageData[]}[]=[];let top=0;
     for(const [title,items]of groups){
       if(grouped){result.push({key:'heading:'+title,top,height:48,title});top+=48;}

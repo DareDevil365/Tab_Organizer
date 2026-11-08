@@ -9,17 +9,17 @@ from app.services.subject_taxonomy import CONCEPTS, canonical_subject_path
 
 
 @pytest.mark.parametrize('topic', ['Programming', 'programming', ' Software Engineering ', 'Technology > Programming'])
-def test_saved_topic_and_title_classification_share_the_same_parent(topic):
-    assert subject_path({'title': 'Cloudflare Cooked', 'topic': topic}) == ('Technology', 'Programming')
+def test_saved_topic_is_not_evidence_for_a_vague_title(topic):
+    assert subject_path({'title': 'Cloudflare Cooked', 'topic': topic}) == ('Needs a Topic',)
     assert subject_path({'title': 'Programming explained'}) == ('Technology', 'Programming')
 
 
 def test_aliases_and_known_categories_resolve_without_overriding_specific_content():
-    assert subject_path({'title': 'An interesting resource', 'topic': 'Artificial Intelligence'}) == ('Technology', 'AI & Machine Learning')
-    assert subject_path({'title': 'An interesting resource', 'category': 'Programming'}) == ('Technology', 'Programming')
+    assert subject_path({'title': 'An interesting resource', 'topic': 'Artificial Intelligence'}) == ('Needs a Topic',)
+    assert subject_path({'title': 'An interesting resource', 'category': 'Programming'}) == ('Needs a Topic',)
     assert subject_path({'title': 'Typography for interfaces', 'topic': 'Programming'}) == ('Creative Work', 'Design', 'Typography')
     assert subject_path({'title': 'An interesting resource', 'category': 'My private bookmark folder'}) == ('Needs a Topic',)
-    assert subject_path({'title': 'An interesting resource', 'topic': 'My special subject'}) == ('My special subject',)
+    assert subject_path({'title': 'An interesting resource', 'topic': 'My special subject'}) == ('Needs a Topic',)
     for path, _ in CONCEPTS:
         for i in range(1, len(path) + 1):
             assert canonical_subject_path(path[i - 1]) == path[:i]
@@ -62,7 +62,7 @@ async def test_mixed_metadata_yields_one_programming_concept_and_preserves_resou
         assert not any(n['label'] == 'youtube.com' for n in graph['nodes'])
         assert len([n for n in graph['nodes'] if n['type'] == 'page']) == 4
         assert resources[0].topic == 'Programming'  # Projection never rewrites saved metadata.
-        assert 'Technology > Programming' in semantic_content(resources[0])
+        assert 'Programming' not in semantic_content(resources[0])
 
 
 @pytest.mark.asyncio

@@ -40,7 +40,7 @@ async def ensure_page_embeddings(db: AsyncSession) -> int:
         fingerprint = hashlib.sha256(text.encode('utf-8')).hexdigest()[:16]
         # v3 also invalidates fallback vectors made with Python's process-seeded
         # hash function, which could not be compared after a backend restart.
-        version = f"{identity}:subjects-v4:{fingerprint}"
+        version = f"{identity}:content-v5:{fingerprint}"
         row = existing.get(page.id)
         if row is None or row.model_name != version:
             pending.append((page, row, text, version))
@@ -104,6 +104,8 @@ async def search_relevant_pages(
                 "url_normalized": page.url_normalized,
                 "domain": page.domain,
                 "description": page.description,
+                "content_summary": page.content_summary,
+                "full_text": (page.full_text or '')[:6000],
                 "topic": page.topic,
                 "category": page.category,
                 "similarity_score": round(sim, 3)
@@ -119,7 +121,8 @@ async def text_relevant_pages(query, db, top_k):
     ranked=await asyncio.to_thread(rank_documents,[{'id':page.id,'title':page.title or '', 'url':page.url_original,'text':semantic_content(page)} for page in pages],query,False)
     by_id={page.id:page for page in pages}
     return [{'id':page.id,'title':page.title,'url':page.url_original,'url_normalized':page.url_normalized,
-        'domain':page.domain,'description':page.description,'topic':page.topic,'category':page.category,
+        'domain':page.domain,'description':page.description,'content_summary':page.content_summary,
+        'full_text':(page.full_text or '')[:6000],'topic':page.topic,'category':page.category,
         'similarity_score':item['score']/100,'retrieval_mode':'related-text'} for item in ranked['results'][:top_k]
         if item['score']>0 for page in [by_id[item['id']]]]
 

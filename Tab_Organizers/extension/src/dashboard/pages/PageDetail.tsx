@@ -5,6 +5,7 @@ import { CompletionButton } from '../components/CompletionButton';
 import { useNoteDraft } from '../useNoteDraft';
 import { pendingSaves, saveOnDevice, onDeviceSync, cacheForBackend } from '../../lib/outbox';
 import { parseNote } from '../../lib/note-data';
+import { pageTopics } from '../../lib/page-filters';
 
 interface PageDetailProps {
   initialNoteId?:string;
@@ -439,7 +440,7 @@ export const PageDetail: React.FC<PageDetailProps> = ({ pageId, initialNoteId, o
             }}>
               {page.domain || 'web'}
             </span>
-            {(page.display_topic || page.topic) && (
+            {(page.display_topic || pageTopics(page).slice(-1)[0]) && (
               <span style={{
                 background: 'rgba(16, 185, 129, 0.2)',
                 border: '1px solid rgba(16, 185, 129, 0.4)',
@@ -449,7 +450,7 @@ export const PageDetail: React.FC<PageDetailProps> = ({ pageId, initialNoteId, o
                 padding: '2px 8px',
                 borderRadius: 6
               }}>
-                #{page.display_topic || page.topic}
+                #{page.display_topic || pageTopics(page).slice(-1)[0]}
               </span>
             )}
             {page.category && (

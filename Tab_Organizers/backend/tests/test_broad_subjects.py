@@ -25,7 +25,7 @@ def test_explicit_mixed_subjects_are_filterable_without_multiple_graph_parents()
     assert subject_path(page)==('Technology','Hardware & Computing')
     assert {'Hobbies','Music & Audio'}.issubset(library_subjects({'title':'Flute lesson'}))
     assert {'Entertainment','Movies & TV'}.issubset(library_subjects({'title':'Movie trailer'}))
-    assert library_subjects({'title':'A useful reference','topic':'My new research interest'})==['My new research interest']
+    assert library_subjects({'title':'A useful reference','topic':'My new research interest'})==[]
 
 
 @pytest.mark.asyncio

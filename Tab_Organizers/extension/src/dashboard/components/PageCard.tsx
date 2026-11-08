@@ -2,6 +2,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import { PageData } from '../../types';
 import { CompletionButton } from './CompletionButton';
 import { coverInk } from '../../lib/cover-palette';
+import { pageTopics } from '../../lib/page-filters';
 
 interface PageCardProps {
   relevance?: number;
@@ -50,8 +51,8 @@ export const PageCard: React.FC<PageCardProps> = ({
   const [menuOpen, setMenuOpen] = useState<boolean>(false);
   const [copied, setCopied] = useState<boolean>(false);
   const menuRef = useRef<HTMLDivElement>(null);
-  const topic = page.display_topic || page.topic;
-  const coverTopic = isMeaningfulTopic(topic) ? topic! : page.category || 'Saved resource';
+  const topic = page.display_topic || pageTopics(page).slice(-1)[0];
+  const coverTopic = isMeaningfulTopic(topic) ? topic! : 'Saved resource';
   const ink = coverInk(coverTopic === 'Saved resource' ? page.title || '' : coverTopic);
 
   useEffect(() => {

@@ -20,7 +20,7 @@ from app.services.completion import completion_kind
 from app.services.content_subjects import subject_path, library_subjects
 from app.services.video_metadata import resolve_video_title, generic_title
 from app.services.url_normalizer import normalize_url, extract_youtube_thumbnail
-from app.services.classifier import classify_single_page_rule, run_background_classification, suggest_page_tags
+from app.services.classifier import run_background_classification
 
 router = APIRouter(prefix="/api/pages", tags=["pages"])
 
@@ -150,30 +150,10 @@ async def upsert_page(
         )
         db.add(page)
 
-    # Auto-classify topic if not explicitly set
-    if not page.topic or page.topic.lower() in ('other', 'none', 'unknown', 'uncategorized'):
-        rule_topic = classify_single_page_rule({
-            "title": page.title,
-            "url": page.url_original or page.url_normalized,
-            "description": page.description,
-            "domain": page.domain,
-            "tags": page.tags
-        })
-        if rule_topic:
-            page.topic = rule_topic
-        else:
-            needs_bg_classification = True
-
-    # Suggest keyword tags if not already populated
-    if not page.tags:
-        sug_tags = suggest_page_tags({
-            "title": page.title,
-            "url": page.url_original or page.url_normalized,
-            "description": page.description,
-            "domain": page.domain
-        })
-        if sug_tags:
-            page.tags = ", ".join(sug_tags)
+    # Saving is storage work, not an opportunity to persist keyword guesses.
+    # Content-derived topics are projected separately; local background work can
+    # fill legacy metadata through the contextual classifier without delaying save.
+    needs_bg_classification = not page.topic or page.topic.lower() in ('other', 'none', 'unknown', 'uncategorized')
 
     await db.commit()
     await db.refresh(page)
@@ -241,30 +221,8 @@ async def bulk_save_pages(
             if fav_icon and not existing.favicon_url:
                 existing.favicon_url = fav_icon
 
-            # Re-evaluate topic for existing tab if it was unclassified or 'other'
             if not existing.topic or existing.topic.lower() in ('other', 'none', 'unknown', 'uncategorized'):
-                rule_topic = classify_single_page_rule({
-                    "title": existing.title or tab_in.title,
-                    "url": existing.url_original,
-                    "description": existing.description or tab_in.description,
-                    "domain": existing.domain or domain,
-                    "tags": existing.tags or tab_in.tags
-                })
-                if rule_topic:
-                    existing.topic = rule_topic
-                else:
-                    needs_bg_classification = True
-
-            # Populate tags if empty
-            if not existing.tags:
-                sug_tags = suggest_page_tags({
-                    "title": existing.title or tab_in.title,
-                    "url": existing.url_original,
-                    "description": existing.description or tab_in.description,
-                    "domain": existing.domain or domain
-                })
-                if sug_tags:
-                    existing.tags = ", ".join(sug_tags)
+                needs_bg_classification = True
 
             existing.last_seen_open_at = now
             existing.updated_at = now
@@ -289,29 +247,8 @@ async def bulk_save_pages(
                 last_seen_open_at=now,
             )
 
-            # Auto-classify topic with rule engine
-            rule_topic = classify_single_page_rule({
-                "title": new_page.title,
-                "url": new_page.url_original,
-                "description": new_page.description,
-                "domain": new_page.domain,
-                "tags": new_page.tags
-            })
-            if rule_topic:
-                new_page.topic = rule_topic
-            else:
+            if not new_page.topic or new_page.topic.lower() in ('other', 'none', 'unknown', 'uncategorized'):
                 needs_bg_classification = True
-
-            # Populate tags if empty
-            if not new_page.tags:
-                sug_tags = suggest_page_tags({
-                    "title": new_page.title,
-                    "url": new_page.url_original,
-                    "description": new_page.description,
-                    "domain": new_page.domain
-                })
-                if sug_tags:
-                    new_page.tags = ", ".join(sug_tags)
 
             db.add(new_page)
             new_count += 1

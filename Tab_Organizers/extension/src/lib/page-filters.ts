@@ -11,8 +11,10 @@ export function applyLibraryFilters<T extends PageData>(pages:T[],filters:Librar
 }
 
 export function pageTopics(page: PageData): string[] {
-  // Generated subtopics extend existing subjects; they do not erase them.
-  const labels = [...(page.subject_topics || []), page.display_topic || '', page.topic || ''];
+  // Content-derived memberships take precedence over old keyword guesses.
+  // Keep compatibility with older/offline records without a subject projection.
+  const projected = Array.isArray(page.subject_topics) || !!page.display_topic;
+  const labels = [...(page.subject_topics || []), page.display_topic || '', projected ? '' : page.topic || ''];
   const seen = new Set<string>();
   return labels.map(label=>label.trim()).filter(label => {
     const key=label.toLowerCase();

@@ -6,7 +6,7 @@ export function rankTextPages<T extends PageData>(pages: T[], query: string): (T
   const terms = normalize(query.trim()).split(/\s+/).filter(Boolean);
   if (!terms.length) return pages;
   return pages.map((page, index) => {
-    const text = normalize([page.title, page.description, page.topic, page.category, page.tags, page.content_summary, page.url_original].filter(Boolean).join(' '));
+    const text = normalize([page.title, page.description, page.content_summary, page.url_original].filter(Boolean).join(' '));
     const count = terms.filter(term => text.includes(term)).length;
     return { page, index, score: count / terms.length * 85 };
   }).sort((a, b) => b.score - a.score || a.index - b.index).map(item => ({ ...item.page, search_score: Math.round(item.score) }));

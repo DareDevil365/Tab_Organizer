@@ -35,7 +35,7 @@ SUBJECT_RULES = [
     (r'\bhackathons?\b|\bdemo day\b', ('Building & Opportunities', 'Hackathons')),
     (r'\bmotion design\w*\b|\bmotion graphics?\b|\bkeyfram\w*\b', ('Creative Work', 'Video Editing', 'Motion Design')),
     (r'\bvideo edit\w*\b|\bfilm edit\w*\b|\bafter ?effects\b|\bpremiere pro\b|\bdavinci resolve\b|\bcapcut\b|\bpost.production\b|\bcompositing\b|\bvfx\b|\bcolor grading\b', ('Creative Work', 'Video Editing')),
-    (r'\bcad\b|\bautocad\b|\bsolidworks\b|\bfusion 360\b|\b3d (?:design|model\w*)\b', ('Creative Work', 'Design', 'CAD & 3D Design')),
+    (r'\bcad\b|\bfreecad\b|\bautocad\b|\bsolidworks\b|\bfusion 360\b|\b3d (?:design|model\w*)\b', ('Creative Work', 'Design', 'CAD & 3D Design')),
     (r'\bmovie\w*\b|\btrailer\b|\bteaser\b|\b(?:film|tv|television) series\b|\bseason \d+\b', ('Entertainment', 'Movies & TV')),
     (r'\b(?:flute|guitar|piano|violin|ukulele|drum|singing)\b|\bmusic lesson\w*\b|\bmusical instrument\w*\b|\bsong\b|\blyrics?\b', ('Hobbies', 'Music & Audio')),
     (r'\brecipe\w*\b|\bcook(?:ing|ery)?\b|\bbaking\b|\bfood lesson\w*\b', ('Hobbies', 'Cooking')),
@@ -66,22 +66,13 @@ SUBJECT_RULES = [
 def subject_path(page: Any) -> tuple[str, ...]:
     # Title evidence wins over boilerplate descriptions and old platform labels.
     title = website_name(page)
-    details = clean_content(' '.join(_get(page, f) for f in ('description', 'content_summary', 'tags')))
+    details = clean_content(' '.join(_get(page, f) for f in ('description', 'content_summary')))
     for corpus in (title, details):
         for pattern, path in SUBJECT_RULES:
             if re.search(pattern, corpus, re.I):
                 return canonical_subject_path(path[-1]) or path
-    topic = _get(page, 'topic')
-    generic = {'other', 'general', 'unknown', 'uncategorized', 'none', 'youtube', 'devfolio', 'video', 'entertainment & video'}
-    if topic.lower() not in generic and topic and not re.search(r'https?://|\b\w+\.\w+\b', topic):
-        cleaned = clean_content(topic)
-        if cleaned:
-            return canonical_subject_path(cleaned) or (cleaned,)
-    # Older resources sometimes stored a known subject in category only.
-    # Unknown category/folder names must not become a new semantic hierarchy.
-    category_path = canonical_subject_path(clean_content(_get(page, 'category')))
-    if category_path:
-        return category_path
+    # Saved labels may be old keyword guesses, not independent content evidence.
+    # Preserve them in storage, but do not turn them into semantic truth.
     # Fallback is the readable website name and its description, never its URL.
     if re.search(r'\bdevfolio\b', title, re.I):
         return ('Building & Opportunities', 'Hackathons')
@@ -91,11 +82,10 @@ def subject_path(page: Any) -> tuple[str, ...]:
 def subject_paths(page: Any, note_text: str = '') -> list[tuple[str, ...]]:
     """Every content-supported subject, without ancestor duplicates or URL evidence."""
     title = website_name(page)
-    details = clean_content(' '.join(_get(page, field) for field in ('description', 'content_summary', 'tags')))
+    details = clean_content(' '.join(_get(page, field) for field in ('description', 'content_summary')))
     matches = []
-    # Titles carry the strongest evidence. Notes and meaningful descriptions can
-    # reveal connections absent from a vague heading, without reading addresses.
-    for corpus in (title, details, clean_content(note_text)):
+    # Notes and saved/automatically suggested tags cannot assign subjects.
+    for corpus in (title, details):
         for pattern, path in SUBJECT_RULES:
             if re.search(pattern, corpus, re.I):
                 path = canonical_subject_path(path[-1]) or path
@@ -107,11 +97,6 @@ def subject_paths(page: Any, note_text: str = '') -> list[tuple[str, ...]]:
         editing_path=canonical_subject_path('Video Editing')
         if editing_path:matches.append(editing_path)
     if not matches: matches = [subject_path(page)]
-    # User breadcrumbs can be deeper than the declared vocabulary too.
-    if matches == [('Needs a Topic',)]:
-        topic = clean_content(_get(page, 'topic'))
-        parts = tuple(part.strip() for part in re.split(r'\s*(?:>|›|→)\s*', topic) if part.strip())
-        if len(parts) > 1: matches = [parts]
     return [path for i, path in enumerate(matches) if path and path not in matches[:i]
             and not any(len(other) > len(path) and other[:len(path)] == path for other in matches)]
 
@@ -120,8 +105,11 @@ def semantic_content(page: Any) -> str:
     title = website_name(page)
     # Platform suffixes are navigation chrome, not semantic subject evidence.
     title = re.sub(r'\s*[-|]\s*(?:YouTube|Vimeo)\s*$', '', title, flags=re.I)
-    parts = [title, '\n'.join(' > '.join(path) for path in subject_paths(page))]
-    parts += [clean_content(_get(page, f)) for f in ('description', 'content_summary', 'tags')]
+    # Embed source content, never a previous classifier's conclusions. Otherwise
+    # one bad label reinforces itself in retrieval and later model answers.
+    parts = [title]
+    parts += [clean_content(_get(page, f)) for f in ('description', 'content_summary')]
+    parts.append(clean_content(_get(page, 'full_text'))[:6000])
     return '\n'.join(part for part in parts if part)
 
 
