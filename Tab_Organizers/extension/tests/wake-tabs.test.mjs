@@ -58,6 +58,39 @@ test('loads only two at once, reports real completion and coalesces repeated req
   assert.equal(f.updates.size + f.removals.size, 0);
 });
 
+test('detects sleeping and restored address-only tabs across websites and local files', () => {
+  for (const url of ['https://github.com/project/repo', 'https://docs.google.com/document/d/example', 'https://news.example.org/article', 'http://localhost:3000/app']) {
+    for (const state of [{discarded:true}, {frozen:true}, {status:'unloaded'}]) {
+      assert.equal(needsTabWake(tab(1,{url,title:'A real page title',discarded:false,...state})),true);
+    }
+    for (const title of ['', 'Untitled tab',new URL(url).hostname,new URL(url).host,url,url.replace(/^https?:\/\//,'')]) {
+      assert.equal(needsTabWake(tab(1,{url,title,discarded:false})),true,`${url}: ${title}`);
+    }
+    assert.equal(needsTabWake(tab(1,{url,title:'A real page title',discarded:false})),false);
+  }
+  assert.equal(needsTabWake(tab(1,{url:'file:///C:/docs/reference.pdf',title:'reference.pdf'})),true);
+  assert.equal(needsTabWake(tab(1,{url:'file:///C:/docs/reference.pdf',title:'reference.pdf',discarded:false})),false);
+});
+
+test('wakes a mixed-site window including unflagged restored tabs without touching healthy tabs', async () => {
+  const f=fixture([
+    tab(1,{url:'https://github.com/project/repo',title:'github.com',discarded:false}),
+    tab(2,{url:'https://docs.google.com/document/d/example',frozen:true,discarded:false}),
+    tab(3,{url:'https://news.example.org/article',title:'News article'}),
+    tab(4,{url:'file:///C:/docs/reference.pdf',title:'reference.pdf'}),
+    tab(5,{url:'https://example.org/editor',title:'My unsaved editor',discarded:false}),
+    tab(6,{active:true}),tab(7,{audible:true}),
+  ]);
+  await f.manager.start(1);await until(()=>f.reloaded.length===2);
+  assert.equal(f.manager.status().total,4);
+  f.complete(1);f.complete(2);await until(()=>f.reloaded.length===4);
+  f.complete(3);f.complete(4);await until(()=>!f.manager.status().running);
+  assert.deepEqual(f.reloaded,[1,2,3,4]);
+  assert.equal(f.manager.status().woken,4);
+  assert.equal(f.rows.get(6).active,true);
+  assert.equal(f.updates.size+f.removals.size,0);
+});
+
 test('rechecks queued tabs instead of reloading a tab the user activated or navigated', async () => {
   const f = fixture([tab(1), tab(2), tab(3), tab(4)]);
   await f.manager.start(1); await until(() => f.reloaded.length === 2);

@@ -37,10 +37,19 @@ export function needsTabWake(tab: WakeTab): boolean {
   if (tab.id === undefined || tab.active || tab.audible || tab.status === 'loading') return false;
   let url: URL;
   try { url = new URL(tab.url || ''); } catch { return false; }
-  if (!['http:', 'https:'].includes(url.protocol)) return false;
+  if (!['http:', 'https:', 'file:'].includes(url.protocol)) return false;
   if (tab.discarded || tab.frozen || tab.status === 'unloaded') return true;
-  // Session-restored YouTube tabs can have a hostname in place of the title
-  // even when Chromium has not marked them discarded yet.
+  // Session restore can expose an address instead of a page title on ANY site,
+  // before Chromium reports discarded/frozen. Do not limit that fallback to video.
+  const rawTitle = (tab.title || '').trim().toLowerCase();
+  if (!rawTitle || ['untitled', 'untitled tab', 'untitled page', 'untitled video'].includes(rawTitle)) return true;
+  const withoutProtocol = (value: string) => value.replace(/^https?:\/\//, '').replace(/\/$/, '');
+  if (rawTitle === url.href.toLowerCase() || withoutProtocol(rawTitle) === withoutProtocol(url.href.toLowerCase())) return true;
+  if (url.protocol === 'file:') return false;
+  const titleHost = withoutProtocol(rawTitle).replace(/^(www|m)\./, '');
+  if (titleHost === url.hostname.toLowerCase().replace(/^(www|m)\./, '') || titleHost === url.host.toLowerCase().replace(/^(www|m)\./, '')) return true;
+  // Retain the branded placeholder used by restored YouTube video tabs, without
+  // reloading a healthy YouTube home page just for being named YouTube.
   const host = url.hostname.replace(/^(www|m)\./, '');
   const video = host === 'youtu.be' ? url.pathname.length > 1 :
     host === 'youtube.com' && ((url.pathname === '/watch' && !!url.searchParams.get('v')) || /^\/(shorts|live|embed)\/[^/]+/.test(url.pathname));

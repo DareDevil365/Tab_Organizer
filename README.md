@@ -11,6 +11,8 @@ unreachable, the extension keeps them pending and uploads them after reconnectin
 The moon button in Open tabs wakes sleeping tabs in the current window and
 refreshes their titles. It turns into a golden sun and works through all eligible
 tabs, two at a time, without switching the active tab.
+It supports sleeping tabs across websites and local files, including restored
+website tabs still displaying an address instead of their page title.
 If it asks you to keep the panel open, leave it open until waking finishes.
 
 Open tabs load directly from the browser while connection and saved-status
