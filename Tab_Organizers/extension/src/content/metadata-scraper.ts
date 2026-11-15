@@ -82,5 +82,4 @@ export function extractPageMetadata(): ScrapedPageMetadata {
   };
 }
 
-// When injected as a direct script via chrome.scripting.executeScript, return the result
-extractPageMetadata();
+// Imported as a function and executed only in the tab being saved.

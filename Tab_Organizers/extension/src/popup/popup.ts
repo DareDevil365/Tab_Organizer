@@ -222,6 +222,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   const selectedTabIds = new Set<number>();
   const selectedSavedTabKeys = new Set<string>();
   const selectedGroupKeys = new Set<string>();
+  let savedGroupsLoading: Promise<any[]> | null = null;
   let currentMode: 'library' | 'group' = 'library';
   let currentGroupSubtab: 'saved' | 'unsaved' = 'saved';
   let savedLibraryUrlSet = new Set<string>();
@@ -243,7 +244,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         if(job.kind==='page'||job.kind==='note'){const url=normalizeUrl(job.payload.url_original||job.payload.video_url);savedLibraryUrlSet.add(url);pendingUrls.add(url);}
         if(job.kind==='remove-page')savedLibraryUrlSet.delete(normalizeUrl(job.payload.url));
       }
-      for(const tab of allOpenTabs){tab.isSavedInLibrary=savedLibraryUrlSet.has(tab.normalizedUrl);tab.pendingSave=pendingUrls.has(tab.normalizedUrl);tab.savedTopic=rows.find(row=>normalizeUrl(row.url_normalized||row.url_original)===tab.normalizedUrl)?.display_topic;}
+      for(const tab of allOpenTabs){tab.isSavedInLibrary=savedLibraryUrlSet.has(tab.normalizedUrl);tab.pendingSave=pendingUrls.has(tab.normalizedUrl);tab.savedTopic=savedLibraryTopics.get(tab.normalizedUrl);}
       syncLine.replaceChildren();
       if(jobs.length){const text=document.createElement('span');text.textContent=`${jobs.length} pending · Saved on device`;const retry=document.createElement('button');retry.textContent='Retry';retry.onclick=()=>void flushSaves(true);syncLine.append(text,retry);}
       else {
@@ -933,13 +934,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     switchToMode('library');
   });
 
-  segGroup?.addEventListener('click', async () => {
+  segGroup?.addEventListener('click', () => {
     if (currentMode === 'group') return;
-    selectedTabIds.clear();
-    selectedSavedTabKeys.clear();
-    selectedGroupKeys.clear();
-    await loadSavedGroups();
     switchToMode('group');
+    // Navigation never waits on a network round trip or device storage.
+    void loadSavedGroups();
   });
 
   subtabSaved?.addEventListener('click', () => {
@@ -1278,13 +1277,30 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // Saved Groups loading & rendering
-  async function loadSavedGroups():Promise<any[]>{
-    let groups=await cacheForBackend<any[]>('groups')||(await storage.get<any[]>('saved_tab_groups'))||[];
-    try{groups=await apiClient.get<any[]>('/api/groups');await cacheForBackend('groups',groups);}catch{}
-    const jobs=(await pendingSaves()).filter(job=>job.kind==='group');
-    const pending=jobs.filter(job=>!groups.some(group=>group.name===job.payload.name&&JSON.stringify(group.tabs)===JSON.stringify(job.payload.tabs))).map(job=>({...job.payload,id:'pending:'+job.payload.client_id,tab_count:job.payload.tabs.length,pendingSync:true}));
-    allSavedGroups=[...pending,...groups];await storage.set('saved_tab_groups',allSavedGroups);updateGroupBadges();
-    if(currentMode==='group')renderTabs();return allSavedGroups;
+  function loadSavedGroups():Promise<any[]> {
+    if (savedGroupsLoading) return savedGroupsLoading;
+    savedGroupsLoading = refreshSavedGroups().finally(() => { savedGroupsLoading = null; });
+    return savedGroupsLoading;
+  }
+  async function refreshSavedGroups():Promise<any[]> {
+    const publish = (groups:any[], jobs:Awaited<ReturnType<typeof pendingSaves>>) => {
+      const pending=jobs.filter(job=>job.kind==='group'&&!groups.some(group=>group.name===job.payload.name&&JSON.stringify(group.tabs)===JSON.stringify(job.payload.tabs)))
+        .map(job=>({...job.payload,id:'pending:'+job.payload.client_id,tab_count:job.payload.tabs.length,pendingSync:true}));
+      allSavedGroups=[...pending,...groups];updateGroupBadges();
+      if(currentMode==='group'){renderTabs();updateSelectionUI();}
+    };
+    try {
+      const [cached,jobs]=await Promise.all([
+        cacheForBackend<any[]>('groups').then(groups=>groups||storage.get<any[]>('saved_tab_groups')),
+        pendingSaves(),
+      ]);
+      publish(cached||[],jobs);
+      const groups=await apiClient.get<any[]>('/api/groups');
+      // Re-read the outbox: saves/removals can happen during the network request.
+      publish(groups,await pendingSaves());
+      await Promise.all([cacheForBackend('groups',groups),storage.set('saved_tab_groups',allSavedGroups)]);
+    } catch { /* Keep the cached groups usable while offline. */ }
+    return allSavedGroups;
   }
 
   function createTabLibraryActionButton(url: string, title?: string, faviconUrl?: string, onToggled?: (saved: boolean) => void): HTMLElement {

@@ -44,26 +44,27 @@ test('restricted pages keep native popup behavior and reset the next toolbar cli
  assert.deepEqual(f.calls,[['popup','src/popup/popup.html'],['native'],['popup','']]);
 });
 
-test('restricted pages use a larger detached panel with an inset and keep source-window scope',async()=>{
- const f=fixture();
- chrome.windows={get:async id=>id===91?{id:91,type:'popup',tabs:[{url:'chrome-extension://test/src/popup/popup.html?detached=true'}]}:({id:42,left:100,top:20,width:1400,height:900}),create:async options=>{f.calls.push(['window',options]);return{id:91};},remove:async id=>f.calls.push(['close-window',id])};
- await openFloatingPanel({id:7,windowId:42,url:'brave://newtab/'});
- assert.equal(f.calls.length,1);const options=f.calls[0][1];
- assert.equal(options.type,'popup');assert.equal(options.width,440);assert.equal(options.height,650);
- assert.equal(options.left,1012);assert.equal(options.top,148);
- assert.equal(new URL(options.url).searchParams.get('sourceWindow'),'42');
- await openFloatingPanel({id:7,windowId:42,url:'brave://newtab/'});
- assert.deepEqual(f.calls.at(-1),['close-window',91]);
+test('restricted and blocked pages never create a separate taskbar window',async()=>{
+ for(const url of ['brave://newtab/','chrome://settings/','chrome-extension://other/page.html']){
+  const f=fixture();
+  chrome.windows={create:async()=>{throw Error('Separate window must not be created');}};
+  await openFloatingPanel({id:7,windowId:42,url});
+  assert.deepEqual(f.calls,[['popup','src/popup/popup.html'],['native',42],['popup','']]);
+ }
  delete chrome.windows;
 });
 
-test('stale detached-window IDs cannot close an unrelated browser window',async()=>{
- const f=fixture();f.data.karlx_detached_panel={id:91};
- chrome.windows={get:async id=>({id,type:'normal',left:0,top:0,width:1400,height:900,tabs:[{url:'https://example.com/'}]}),create:async options=>{f.calls.push(['window',options]);return{id:92};},remove:async id=>f.calls.push(['close-window',id])};
- await openFloatingPanel({id:7,windowId:42,url:'brave://newtab/'});
- assert.equal(f.calls.length,1);assert.equal(f.calls[0][0],'window');assert.equal(f.data.karlx_detached_panel.id,92);
- delete chrome.windows;
+test('rapid toolbar clicks share one pending open instead of invalidating its token',async()=>{
+ const f=fixture();let finish;
+ chrome.scripting.executeScript=async options=>{f.calls.push(['inject',options]);await new Promise(resolve=>finish=resolve);return[{result:'opened'}];};
+ const first=openFloatingPanel({id:7,windowId:42,url:'https://example.com'});
+ const second=openFloatingPanel({id:7,windowId:42,url:'https://example.com'});
+ assert.equal(first,second);
+ await new Promise(resolve=>setTimeout(resolve,0));assert.equal(f.calls.length,1);finish();await first;
+ await openFloatingPanel({id:8,windowId:42,url:'chrome://settings/'});
+ assert.equal(f.calls.filter(call=>call[0]==='native').length,1);
 });
+
 test('native fallback targets the browser window where the user clicked',async()=>{
  const f=fixture();await openFloatingPanel({id:7,windowId:42,url:'chrome://extensions/'});
  assert.deepEqual(f.calls,[['popup','src/popup/popup.html'],['native',42],['popup','']]);
@@ -112,4 +113,19 @@ test('discarded tabs are not woken merely to close a panel that no longer exists
  chrome.tabs={get:async()=>({id:7,windowId:1,url:'https://example.com',discarded:true})};
  await closeInactivePanels(8,1);
  assert.deepEqual(f.calls,[]);assert.equal(f.data.karlx_panel_7,undefined);
+});
+
+
+test('a stalled page injection falls back and releases the next toolbar click',async()=>{
+ const f=fixture();const original=setTimeout;
+ globalThis.setTimeout=(fn,ms,...args)=>original(fn,ms===5000?0:ms,...args);
+ chrome.scripting.executeScript=()=>new Promise(()=>{});
+ try {
+  await openFloatingPanel({id:7,windowId:42,url:'https://example.com'});
+  assert.equal(f.data.karlx_panel_7,undefined);
+  assert.deepEqual(f.calls,[['popup','src/popup/popup.html'],['native',42],['popup','']]);
+  chrome.scripting.executeScript=async()=>[{result:'opened'}];
+  await openFloatingPanel({id:7,windowId:42,url:'https://example.com'});
+  assert.ok(f.data.karlx_panel_7);
+ } finally {globalThis.setTimeout=original;}
 });

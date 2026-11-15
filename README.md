@@ -17,6 +17,10 @@ If it asks you to keep the panel open, leave it open until waking finishes.
 
 Open tabs load directly from the browser while connection and saved-status
 checks run separately. Floating panels close when you switch tabs.
+Groups navigation shows cached content while the server refreshes in the
+background. On restricted browser pages the extension uses a toolbar popup,
+without creating a separate desktop window. Panel styling is isolated from the
+website; the extension does not install a browser theme or website dark mode.
 
 Focus the Library search box to choose from colored category pills. Categories
 follow content-derived subjects; stale keyword labels cannot override them. Typing switches
