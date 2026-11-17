@@ -1,10 +1,12 @@
 import datetime
 from collections import defaultdict
-from typing import List, Optional, Annotated
+from typing import List, Optional, Annotated, Literal
 from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, Query, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
+from pydantic import BaseModel, Field
+from app.models.cloud_state import AppDocument
 
 from app.database import get_db
 from app.models.activity import ActivityLog
@@ -252,3 +254,61 @@ async def get_weekly_digest(db: AsyncSession = Depends(get_db)):
         "topic_breakdown": summary.topic_breakdown[:5],
     }
 
+
+# Estimate attention from the existing content-derived subjects, never the host,
+# legacy saved category or a single word from a title.
+def attention_kind(subject: str | None) -> str:
+    import re
+    label = (subject or '').casefold()
+    if re.search(r'\b(?:education|learning|study|lectures?|tutorials?|productivity|programming|engineering|mathematics|science|research|design|finance|hardware|technology|artificial intelligence)\b', label):
+        return 'other'
+    if re.search(r'\b(?:entertainment|movies?|television|tv series|web series|anime|sitcoms?|comedy|celebrity|gaming|gameplay|reality tv|music videos?)\b', label):
+        return 'leisure'
+    return 'uncertain'
+
+@router.get('/attention')
+async def attention_summary(
+    today: datetime.datetime, week: datetime.datetime, session: datetime.datetime,
+    db: AsyncSession=Depends(get_db),
+):
+    from app.services.activity_subjects import documents_for, content_key, read_payload
+    def utc(value):
+        return value.replace(tzinfo=datetime.timezone.utc) if value.tzinfo is None else value.astimezone(datetime.timezone.utc)
+    now=datetime.datetime.now(datetime.timezone.utc)
+    # Limit this read to recent intervals. Never interpret bare historic hosts as leisure.
+    floor=now-datetime.timedelta(days=8)
+    starts={name:max(floor,min(now,utc(value))) for name,value in (('today',today),('week',week),('session',session))}
+    result={key:{'leisure':0,'other':0,'uncertain':0} for key in starts}
+    rows=(await db.execute(select(ActivityLog.url,ActivityLog.started_at,ActivityLog.ended_at,ActivityLog.duration_seconds)
+        .where(ActivityLog.ended_at>min(starts.values()),ActivityLog.started_at<now))).all()
+    urls=list({row.url for row in rows})
+    kinds={}
+    for index in range(0,len(urls),250):
+        batch=urls[index:index+250];documents=await documents_for(db,batch)
+        overrides={row.key:row.payload for row in (await db.execute(select(AppDocument).where(
+            AppDocument.key.in_(['attention:'+content_key(url) for url in batch])))).scalars()}
+        for url in batch:
+            key=content_key(url)
+            kinds[url]=overrides.get('attention:'+key) or attention_kind(read_payload(documents.get(key)).get('subject'))
+    for row in rows:
+        start,end=utc(row.started_at),min(now,utc(row.ended_at))
+        for key,cutoff in starts.items():
+            seconds=min(row.duration_seconds,int((end-max(start,cutoff)).total_seconds()))
+            if seconds>0:result[key][kinds[row.url]]+=seconds
+    return result
+
+class AttentionOverride(BaseModel):
+    url: str = Field(max_length=6000, pattern=r'^https?://')
+    choice: Literal['leisure','other','auto']
+
+@router.put('/attention')
+async def set_attention_override(payload: AttentionOverride, db: AsyncSession=Depends(get_db)):
+    from app.services.activity_subjects import content_key
+    key='attention:'+content_key(payload.url)
+    row=await db.get(AppDocument,key)
+    if payload.choice=='auto':
+        if row:await db.delete(row)
+    elif row:row.payload=payload.choice
+    else:db.add(AppDocument(key=key,payload=payload.choice))
+    await db.commit()
+    return {'choice':payload.choice}

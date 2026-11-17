@@ -1,3 +1,4 @@
+import { mountReminderButton } from '../lib/reminder-ui';
 import { cacheForBackend,onDeviceSync,pendingSaves,saveOnDevice,savePagesOnDevice as queuePageSaves,removeSavedUrl,startSaveSync,flushSaves } from '../lib/outbox';
 import { deviceGet,deviceSet } from '../lib/device-store';
 import { getBackendConnection } from '../lib/backend-connection';
@@ -3051,6 +3052,7 @@ document.addEventListener('DOMContentLoaded', async () => {
         companionCommentInput.placeholder = 'A note or pasted image…';
       }
     }
+    reminderControl.paint();
     updateCompanionBadges();
     if (companionNotesModal.style.display === 'flex') renderCompanionNotesList();
   }
@@ -3498,6 +3500,47 @@ document.addEventListener('DOMContentLoaded', async () => {
     } catch { showToast('Clipboard unavailable. Try copying again.', 'error'); }
   });
 
+  const reminderControl=mountReminderButton(document.getElementById('btn-page-reminder') as HTMLButtonElement,()=>({
+    url:activeCompanionUrl||allOpenTabs.find(tab=>tab.active)?.url||'',
+    title:companionVideoName.textContent||allOpenTabs.find(tab=>tab.active)?.title||'Page reminder',note:companionCommentInput.value,
+  }));
+  window.addEventListener('unload',reminderControl.stop);
+  const attention=document.querySelector<HTMLDetailsElement>('#attention-summary')!;
+  const totals=attention.querySelector<HTMLElement>('.attention-totals')!;
+  let attentionLoading=false,attentionLoadedAt=0;
+  const loadAttention=async()=>{
+    if(!attention.open||attentionLoading||Date.now()-attentionLoadedAt<60000)return;
+    attentionLoading=true;totals.textContent='Checking recorded activity…';
+    try {
+      const today=new Date();today.setHours(0,0,0,0);
+      const week=new Date(today);week.setDate(week.getDate()-((week.getDay()+6)%7));
+      const started=await storage.get<number>('browser_startup_time');
+      const params=new URLSearchParams({today:today.toISOString(),week:week.toISOString(),session:new Date(started||Date.now()).toISOString()});
+      const data=await apiClient.get<Record<'today'|'session'|'week',{leisure:number;uncertain:number}>>('/api/activity/attention?'+params);
+      const format=(seconds:number)=>seconds<60?(seconds?' <1m':'0m'):seconds<3600?`${Math.floor(seconds/60)}m`:`${Math.floor(seconds/3600)}h ${Math.floor(seconds%3600/60)}m`;
+      const slots=(['today','session','week'] as const).map((key,index)=>{
+        const item=document.createElement('span');const value=document.createElement('strong');
+        value.textContent=started||key!=='session'?format(data[key].leisure):'—';
+        const label=document.createElement('small');label.textContent=['Today','This session','This week'][index];
+        item.append(value,label);return item;
+      });
+      const caption=document.createElement('small');caption.className='attention-caption';
+      caption.textContent=`Likely entertainment · ${format(data.today.uncertain)} unclassified today`;
+      totals.replaceChildren(...slots,caption);attentionLoadedAt=Date.now();
+    }catch{totals.textContent='Can’t load activity right now. Close and reopen to retry.';}
+    finally{attentionLoading=false;}
+  };
+  attention.addEventListener('toggle',()=>void loadAttention());
+  const attentionChoice=attention.querySelector<HTMLSelectElement>('#attention-choice')!;
+  attentionChoice.addEventListener('change',async()=>{
+    const url=allOpenTabs.find(tab=>tab.active)?.url||'';
+    if(!attentionChoice.value)return;
+    if(!/^https?:\/\//i.test(url)){totals.textContent='Select a web page to adjust its estimate.';attentionChoice.value='';return;}
+    attentionChoice.disabled=true;
+    try {await apiClient.put('/api/activity/attention',{url,choice:attentionChoice.value});attentionLoadedAt=0;await loadAttention();}
+    catch{totals.textContent='Could not save that correction. Try again when connected.';}
+    finally{attentionChoice.disabled=false;attentionChoice.value='';}
+  });
   // Initial load & poll for video companion
   companionReady = true;
   startSaveSync();

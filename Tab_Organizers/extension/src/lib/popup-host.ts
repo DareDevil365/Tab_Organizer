@@ -22,7 +22,7 @@ export async function preparePopupHost(): Promise<boolean> {
   window.parent.postMessage({ type: 'KARLX_PANEL_READY', token: panelToken }, '*');
   document.getElementById('btn-close-panel')?.addEventListener('click', closePopup);
   document.addEventListener('keydown', event => {
-    if (event.key !== 'Escape') return;
+    if (event.key !== 'Escape' || document.querySelector('dialog[open]')) return;
     // An inner dialog gets the first Escape; the next closes the panel.
     const modal = Array.from(document.querySelectorAll<HTMLElement>('.win-modal-overlay')).some(element => getComputedStyle(element).display !== 'none');
     if (!modal) closePopup();

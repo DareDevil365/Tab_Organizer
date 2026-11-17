@@ -3,7 +3,7 @@ import type { BackendConnection } from './backend-connection';
 import { deviceChange, deviceEntries, deviceSet, deviceGet } from './device-store';
 import { normalizeUrl } from './url-normalize';
 
-export type SaveKind = 'page' | 'note' | 'group' | 'remove-page' | 'remove-note';
+export type SaveKind = 'reminder' | 'page' | 'note' | 'group' | 'remove-page' | 'remove-note';
 export interface PendingSave {
   key: string; backend: string; kind: SaveKind; payload: any; version: string;
   createdAt: number; attempts: number; retryAt: number; leaseUntil: number;
@@ -30,7 +30,7 @@ export async function saveOnDevice(kind: SaveKind, payload: any): Promise<Pendin
     const address=new URL(kind==='note'?payload.video_url:payload.url_original);
     if(!['http:','https:'].includes(address.protocol))throw new Error('Save a web page with an HTTP or HTTPS address.');
   }
-  const identity = kind === 'note' || kind === 'remove-note' ? payload.id : kind === 'group' ? (payload.client_id ||= crypto.randomUUID()) : normalizeUrl(payload.url_original || payload.url);
+  const identity = kind === 'reminder' || kind === 'note' || kind === 'remove-note' ? payload.id : kind === 'group' ? (payload.client_id ||= crypto.randomUUID()) : normalizeUrl(payload.url_original || payload.url);
   if (!identity) throw new Error('This page has no saveable address');
   const key = JSON.stringify([connection.url, kind === 'remove-page' ? 'page' : kind === 'remove-note' ? 'note' : kind, identity]);
   const job = { key, backend: connection.url, kind, payload, version: crypto.randomUUID(), createdAt: Date.now(), attempts: 0, retryAt: 0, leaseUntil: 0 };
@@ -95,9 +95,9 @@ async function flushOwned(connection:BackendConnection,force:boolean,renew:()=>P
       for(const job of claimed)await deviceChange<PendingSave>('outbox',job.key,current=>current?{...current,leaseUntil:0}:undefined);return;
     }
     const job=claimed[0],removing=job.kind.startsWith('remove-');
-    const endpoint=job.kind==='page'?'/api/pages/save-bulk':job.kind==='note'?'/api/companion':job.kind==='group'?'/api/groups':job.kind==='remove-note'?'/api/companion/'+encodeURIComponent(job.payload.id):'/api/pages/by-url?url='+encodeURIComponent(job.payload.url);
+    const endpoint=job.kind==='reminder'?'/api/reminders/scheduled/'+encodeURIComponent(job.payload.id):job.kind==='page'?'/api/pages/save-bulk':job.kind==='note'?'/api/companion':job.kind==='group'?'/api/groups':job.kind==='remove-note'?'/api/companion/'+encodeURIComponent(job.payload.id):'/api/pages/by-url?url='+encodeURIComponent(job.payload.url);
     try{
-      const response=await fetch(connection.url+endpoint,{method:removing?'DELETE':'POST',headers:{'Content-Type':'application/json',...(connection.key?{Authorization:'Bearer '+connection.key}:{})},
+      const response=await fetch(connection.url+endpoint,{method:job.kind==='reminder'?'PUT':removing?'DELETE':'POST',headers:{'Content-Type':'application/json',...(connection.key?{Authorization:'Bearer '+connection.key}:{})},
         body:removing?undefined:JSON.stringify(job.kind==='page'?{tabs:claimed.map(item=>item.payload)}:job.payload),signal:AbortSignal.timeout(20000)});
       if(!response.ok&&!(removing&&response.status===404)){
         const blocked=response.status>=400&&response.status<500&&![408,429].includes(response.status),body=await response.json().catch(()=>null);

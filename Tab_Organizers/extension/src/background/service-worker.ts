@@ -1,6 +1,7 @@
+import { ReminderManager, REMINDER_ALARM, PageReminder } from '../lib/reminders';
 import { apiClient } from '../lib/api-client';
 import { storage } from '../lib/storage';
-import { flushSaves, saveOnDevice } from '../lib/outbox';
+import { flushSaves, saveOnDevice, cacheForBackend, pendingSaves } from '../lib/outbox';
 import { normalizeUrl } from '../lib/url-normalize';
 import { ActivityTracker, TrackingContext } from '../lib/activity-tracker';
 import { TabWakeManager } from '../lib/wake-tabs';
@@ -17,7 +18,7 @@ const FLUSH_ACTIVITY_ALARM = 'flush-activity-logs';
 const tabWakeManager = new TabWakeManager(chrome.tabs, progress => {
   void Promise.resolve(chrome.runtime.sendMessage({ type: 'TAB_WAKE_PROGRESS', progress })).catch(() => {});
 });
-chrome.storage.onChanged.addListener(changes=>{if(changes.backend_connection)void flushSaves(true);});
+chrome.storage.onChanged.addListener(changes=>{if(changes.backend_connection){void flushSaves(true);lastReminderPull=0;void syncPageReminders();}});
 
 chrome.action.onClicked.addListener(tab => {
   void openFloatingPanel(tab).catch(error => console.debug('Could not open tabs panel:', error));
@@ -178,7 +179,11 @@ chrome.contextMenus.onClicked.addListener(async (info, tab) => {
 
 // 2. Alarm Dispatcher
 chrome.alarms.onAlarm.addListener(async (alarm) => {
+  if (alarm.name.startsWith(REMINDER_ALARM)) {
+    await pageReminders.reconcile().catch(()=>{});return;
+  }
   if (alarm.name === HEALTH_ALARM) {
+    void syncPageReminders();
     await checkBackendHealth();
     await flushSaves();
   } else if (alarm.name === FLUSH_ACTIVITY_ALARM) {
@@ -573,6 +578,13 @@ async function restoreTabGroupsForWindow(
 
 // 7. Message Handlers for Reincarnation
 chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+  if (message.type === 'SET_PAGE_REMINDER' || message.type === 'CHANGE_PAGE_REMINDER' || message.type === 'GET_PAGE_REMINDERS') {
+    // Only privileged extension documents can schedule notifications.
+    if(_sender.id!==chrome.runtime.id||!_sender.url?.startsWith(chrome.runtime.getURL('')))return false;
+    const job=message.type==='GET_PAGE_REMINDERS'?readPageReminders():message.type==='SET_PAGE_REMINDER'?pageReminders.set(message.reminder):pageReminders.change(message.id,message.action,message.minutes);
+    job.then(reminder=>sendResponse({success:true,reminder}),error=>sendResponse({success:false,error:error.message||'Could not save reminder'}));
+    return true;
+  }
   if (message.type === 'GET_TAB_WAKE_STATUS') {
     sendResponse({ success: true, progress: tabWakeManager.status() });
     return false;
@@ -1152,3 +1164,46 @@ async function checkPendingReminders() {
     }
   } catch {}
 }
+async function cachePageReminders(rows:PageReminder[]) {
+  await cacheForBackend('reminders',rows);
+  void chrome.runtime.sendMessage({type:'PAGE_REMINDERS_CHANGED'}).catch(()=>{});
+}
+async function readPageReminders():Promise<PageReminder[]> {return await cacheForBackend<PageReminder[]>('reminders')||[];}
+const pageReminders = new ReminderManager({
+  read: readPageReminders,
+  write: async rows => {
+    const old=await readPageReminders();
+    for(const row of rows)if(JSON.stringify(row)!==JSON.stringify(old.find(item=>item.id===row.id)))await saveOnDevice('reminder',row);
+    await cachePageReminders(rows);
+  },
+  alarm: async (name,when) => {const saved=await chrome.alarms.get(name);if(saved?.scheduledTime!==when)await chrome.alarms.create(name,{when});},
+  cache: cachePageReminders,
+  clear: name => chrome.alarms.clear(name),
+  notify: (id,title,message) => new Promise((resolve,reject)=>chrome.notifications.create(id,{type:'basic',iconUrl:'public/icons/icon128.png',title,message,priority:2,requireInteraction:true,
+    buttons:[{title:'Snooze 15 min'},{title:'Done'}]},()=>{const error=chrome.runtime.lastError;if(error)reject(new Error(error.message));else resolve(undefined);})),
+});
+let syncingReminders=false,lastReminderPull=0;
+async function syncPageReminders(){
+  if(syncingReminders)return;syncingReminders=true;
+  try {
+    await pageReminders.reconcile();
+    if(Date.now()-lastReminderPull<120000)return;
+    lastReminderPull=Date.now();
+    const remote=await apiClient.get<PageReminder[]>('/api/reminders/scheduled');
+    const pending=(await pendingSaves()).filter(job=>job.kind==='reminder').map(job=>job.payload);
+    await pageReminders.merge(remote,pending);await pageReminders.reconcile();
+  }catch{/* Stored device alarms remain available offline. */}
+  finally{syncingReminders=false;}
+}
+void syncPageReminders();
+chrome.notifications.onButtonClicked.addListener((id,index)=>{
+  if(!id.startsWith(REMINDER_ALARM))return;
+  void pageReminders.change(id.slice(REMINDER_ALARM.length),index===0?'snooze':'complete',15).then(()=>chrome.notifications.clear(id)).catch(()=>{});
+});
+chrome.notifications.onClicked.addListener(id=>{
+  if(!id.startsWith(REMINDER_ALARM))return;
+  void (async()=>{
+    await chrome.tabs.create({url:chrome.runtime.getURL('src/dashboard/dashboard.html')+'?reminder='+encodeURIComponent(id.slice(REMINDER_ALARM.length))+'#reminders'});
+    await chrome.notifications.clear(id);
+  })().catch(()=>{});
+});

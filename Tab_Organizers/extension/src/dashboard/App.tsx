@@ -1,3 +1,4 @@
+import { Reminders } from './pages/Reminders';
 import { applyLibraryFilters, LibraryFilters, emptyFilters } from '../lib/page-filters';
 import React, { useState, useEffect, useRef } from 'react';
 import { Library } from './pages/Library';
@@ -20,7 +21,7 @@ import { RecycleBin } from './components/RecycleBin';
 import { ResourceSearch } from './components/ResourceSearch';
 import { normalizeUrl } from '../lib/url-normalize';
 
-type NavTab = 'home' | 'library' | 'groups' | 'sessions' | 'notes' | 'time' | 'graph' | 'settings';
+type NavTab = 'reminders' | 'home' | 'library' | 'groups' | 'sessions' | 'notes' | 'time' | 'graph' | 'settings';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<NavTab>('home');
@@ -82,7 +83,7 @@ export const App: React.FC = () => {
         setActiveTab('groups');
       } else {
         const tab = h.slice(1) as NavTab;
-        setActiveTab(['home', 'library', 'time', 'graph', 'settings'].includes(tab) ? tab : 'home');
+        setActiveTab(['home', 'library', 'time', 'graph', 'reminders', 'settings'].includes(tab) ? tab : 'home');
       }
     };
     handleHash();
@@ -244,8 +245,8 @@ export const App: React.FC = () => {
   const librarySearch = useLibrarySearch(availablePages, searchQuery);
   const filtered = applyLibraryFilters(librarySearch.pages, filters);
   const isLibrary = ['home', 'library', 'notes'].includes(activeTab);
-  const titles: Record<NavTab, string> = { home: 'Library', library: 'Library', groups: 'Collections', sessions: 'Sessions', notes: 'Notes', time: 'Activity', graph: 'Your knowledge', settings: 'Settings' };
-  const subtitles: Record<NavTab, string> = { home: 'A little less scattered. A little more yours.', library: 'A little less scattered. A little more yours.', groups: 'Keep the threads of an idea together.', sessions: 'A place to leave off. A way to come back.', notes: 'The things you wanted to remember.', time: 'What you finished. Where your attention went.', graph: 'Follow a thought. See what connects.', settings: 'Make this space work your way.' };
+  const titles: Record<NavTab, string> = { home: 'Library', library: 'Library', groups: 'Collections', sessions: 'Sessions', notes: 'Notes', reminders: 'Reminders', time: 'Activity', graph: 'Your knowledge', settings: 'Settings' };
+  const subtitles: Record<NavTab, string> = { home: 'A little less scattered. A little more yours.', library: 'A little less scattered. A little more yours.', groups: 'Keep the threads of an idea together.', sessions: 'A place to leave off. A way to come back.', notes: 'The things you wanted to remember.', reminders: 'Follow up on what matters.', time: 'What you finished. Where your attention went.', graph: 'Follow a thought. See what connects.', settings: 'Make this space work your way.' };
 
   const handleNavClick = (tab: NavTab) => {
     setSearchQuery('');
@@ -335,6 +336,7 @@ export const App: React.FC = () => {
     { tab: 'groups', label: 'Collections', icon: 'layers' },
     { tab: 'sessions', label: 'Sessions', icon: 'window' },
     { tab: 'notes', label: 'Notes', icon: 'note' },
+    { tab: 'reminders', label: 'Reminders', icon: 'reminder' },
     { tab: 'time', label: 'Activity', icon: 'activity' },
   ];
 
@@ -375,6 +377,7 @@ export const App: React.FC = () => {
         {loadError && isLibrary && <div className="connection-notice" role="alert"><span>Can’t connect to your library. Check the backend connection in Settings.</span><button className="pill" onClick={loadPages}>Retry connection</button></div>}
         {actionError && isLibrary && <div className="connection-notice" role="alert"><span>{actionError}</span><button className="pill" onClick={() => setActionError('')}>Dismiss</button></div>}
         <div className="workspace-content">
+          {activeTab==='reminders'&&<Reminders/>}
           {activeTab==='notes'&&<Notes pages={availablePages} query={searchQuery} onOpen={(id,noteId)=>{openResource(id);setSelectedNoteId(noteId);}}/>}
           {((isLibrary&&activeTab!=='notes') || activeTab === 'sessions') && <Library view={activeTab === 'sessions' ? 'sessions' : 'library'} toolbarActions={<><LibrarySelection active={selectionMode} onActiveChange={setSelectionMode} selected={selectedIds} onSelectionChange={setSelectedIds} pages={pages} visibleIds={filtered.map(p => p.id).filter(id=>id>0)} onDeletePages={handleDeletePages} onPagesUpdated={applyPageUpdates} /><button className="workspace-view-toggle" onClick={() => handleNavClick('graph')} title="Show map view" aria-label="Show map view"><Icon name="map" /></button></>} filteredPages={filtered} searchStatus={librarySearch} searchQuery={searchQuery} setSearchQuery={setSearchQuery} filters={filters} setFilters={setFilters} pages={availablePages} loading={loading} onRefresh={loadPages} onToggleImportant={handleToggleImportant} onToggleUrgent={handleToggleUrgent} onDelete={id=>{const page=availablePages.find(page=>page.id===id);if(id<0&&page)void import('../lib/outbox').then(module=>module.removeSavedUrl(page.url_original));else handleDelete(id);}} onSelectPage={openResource} onCompletionUpdated={page => applyPageUpdates([page])} selectionMode={selectionMode} selectedIds={selectedIds} onToggleSelection={id => setSelectedIds(previous => { const next = new Set(previous); if (next.has(id)) next.delete(id); else next.add(id); return next; })} />}
           {activeTab === 'groups' && <div className="subpage-container"><SavedGroups /></div>}
@@ -401,6 +404,7 @@ function Icon({ name }: { name: string }) {
     layers: <><path d="m12 3 9 5-9 5-9-5 9-5Z" /><path d="m3 12 9 5 9-5M3 16l9 5 9-5" /></>,
     window: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M3 9h18M7 6.5h.01M10 6.5h.01" /></>,
     note: <><path d="M14 3H5a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-9M8 7h3M8 12h3M8 17h8m1-14 4 4-7 7h-4v-4l7-7Z" /></>,
+    reminder: <><circle cx="12" cy="13" r="8"/><path d="M12 8v5l3 2M3 5l4-3m10 0 4 3"/></>,
     activity: <><path d="M4 20V10m5 10V5m6 15V12m5 8V3" /></>,
     settings: <><path d="M4 6h16M4 12h16M4 18h16" /><circle cx="9" cy="6" r="2" /><circle cx="15" cy="12" r="2" /><circle cx="8" cy="18" r="2" /></>,
     sidebar: <><rect x="3" y="4" width="18" height="16" rx="2" /><path d="M9 4v16" /></>,

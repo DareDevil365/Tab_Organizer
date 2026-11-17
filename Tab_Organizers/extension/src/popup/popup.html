@@ -142,6 +142,8 @@
     </div>
   </div>
 
+  <details class="attention-summary" id="attention-summary"><summary>Browsing check-in</summary><div class="attention-totals" aria-live="polite"></div><div class="attention-correction"><label for="attention-choice">This page</label><select id="attention-choice"><option value="">Adjust estimate…</option><option value="other">Intentional use</option><option value="leisure">Entertainment</option><option value="auto">Use automatic estimate</option></select></div></details>
+
   <!-- Video Companion Dock -->
   <div class="companion-dock" id="companion-dock">
     <div class="companion-bar-header">
@@ -149,6 +151,7 @@
         <span class="companion-video-name" id="companion-video-name"></span>
       </div>
       <div class="companion-header-right">
+        <button type="button" class="reminder-clock" id="btn-page-reminder" aria-label="Set a reminder" title="Set a reminder"></button>
         <button class="companion-notes-toggle-btn" id="btn-toggle-companion-notes" title="View notes for tabs open in this window">
           <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M5 3h14v18H5zM8 3v18M11 8h5m-5 4h5"/></svg>
           <span class="companion-badge" id="companion-notes-count">0</span>

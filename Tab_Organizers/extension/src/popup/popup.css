@@ -2315,3 +2315,9 @@ body { border-radius:22px; border:1px solid #ffffff12; clip-path:inset(0 round 2
 .companion-plus-btn > svg { display:block; flex-shrink:0; }
 .btn-lib-action { padding:0; display:flex; align-items:center; justify-content:center; line-height:0; }
 .btn-lib-action > svg { display:block; }
+
+
+.attention-summary{margin:3px 16px 6px;padding:6px 9px;border:1px solid var(--ink-border);border-radius:10px;color:var(--ink-muted);font-size:11px;flex:none}
+.attention-summary summary{cursor:pointer}.attention-totals{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:5px;margin-top:6px}.attention-totals span{display:grid}.attention-totals strong{color:var(--ink-text);font-size:14px}.attention-caption{grid-column:1/-1;color:var(--ink-subtle)}
+
+.attention-correction{display:flex;align-items:center;gap:8px;margin-top:8px}.attention-correction select{min-width:0;color:var(--ink-text);background:var(--ink-raised);border:1px solid var(--ink-border);border-radius:6px;padding:3px;font:inherit}

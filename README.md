@@ -33,6 +33,18 @@ and companion notes as subject evidence. Saving never waits for classification.
 If contextual AI is unavailable, weak keyword matches remain unclassified.
 
 Activity subjects use recorded page titles and video channels, including unsaved
+videos. The popup's **Browsing check-in** estimates entertainment time from
+those subjects for today, this browser session and this week. Unclassified
+time stays separate; you can correct the current page's estimate.
+
+Use the clock above the popup notes bar to set a page reminder. Confirm a typed
+schedule or choose a time manually. Reminders support daily and alternate-day
+repeats, multiple times per day, Snooze and Done. Manage them under **Reminders**
+in the dashboard. The device catches up on missed alerts when the browser opens
+and syncs changes to the backend. Export a calendar file for an independent
+reminder on your phone; check the calendar's notification settings after import.
+
+Activity subject headings use recorded content from saved and unsaved
 videos. Headings reflect the selected time period, with small interests grouped
 together. Subject inference runs on the hosted backend separately from recording
 time, uses the configured AI provider, and retries later if it is unavailable.
