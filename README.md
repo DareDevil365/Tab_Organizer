@@ -41,8 +41,9 @@ Use the clock above the popup notes bar to set a page reminder. Confirm a typed
 schedule or choose a time manually. Reminders support daily and alternate-day
 repeats, multiple times per day, Snooze and Done. Manage them under **Reminders**
 in the dashboard. The device catches up on missed alerts when the browser opens
-and syncs changes to the backend. Export a calendar file for an independent
-reminder on your phone; check the calendar's notification settings after import.
+and syncs changes to the backend. With Google Calendar configured on the backend,
+connect from Reminders to mirror events to a dedicated calendar and receive phone
+alerts. You can also export a calendar file for manual import.
 
 Activity subject headings use recorded content from saved and unsaved
 videos. Headings reflect the selected time period, with small interests grouped

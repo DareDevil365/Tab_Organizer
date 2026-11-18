@@ -1,3 +1,4 @@
+import asyncio
 import os
 import uvicorn
 from contextlib import asynccontextmanager
@@ -16,6 +17,7 @@ from app.routers import (
     library,
     brain,
     reminders,
+    google_calendar,
     graph,
     backup,
     windows,
@@ -128,6 +130,7 @@ app.include_router(activity.router)
 app.include_router(library.router)
 app.include_router(brain.router)
 app.include_router(reminders.router)
+app.include_router(google_calendar.router)
 app.include_router(graph.router)
 app.include_router(backup.router)
 app.include_router(windows.router)
@@ -146,6 +149,10 @@ async def maintenance():
     from app.services.recycle_bin import purge_expired
     async with async_session_maker() as session:
         await purge_expired(session)
+    try:
+        await asyncio.wait_for(google_calendar.backfill(), timeout=120)
+    except TimeoutError:
+        pass
     return {'status':'ok'}
 
 

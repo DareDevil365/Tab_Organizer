@@ -32,6 +32,10 @@ class Settings(BaseSettings):
     SUPABASE_URL: str | None = None
     BACKEND_API_KEY: str | None = None
     CRON_SECRET: str | None = None
+    GOOGLE_CLIENT_ID: str | None = None
+    GOOGLE_CLIENT_SECRET: str | None = None
+    GOOGLE_CALENDAR_REDIRECT_URI: str | None = None
+    GOOGLE_CALENDAR_TOKEN_KEY: str | None = None
 
     @property
     def cloud(self):

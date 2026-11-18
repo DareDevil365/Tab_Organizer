@@ -1,7 +1,7 @@
 import { normalizeUrl } from './url-normalize';
 
 export const REMINDER_ALARM = 'page-reminder:';
-export interface PageReminder { id:string;url:string;title:string;note:string;at:number;firedAt?:number;completedAt?:number;deletedAt?:number;updatedAt?:number;repeat?:{everyDays:number;times:string[];startDate:string;timezone:string} }
+export interface PageReminder { id:string;url:string;title:string;note:string;at:number;firedAt?:number;completedAt?:number;deletedAt?:number;updatedAt?:number;calendarStartAt?:number;snoozedUntil?:number;repeat?:{everyDays:number;times:string[];startDate:string;timezone:string} }
 export interface ReminderBrowser {
   read():Promise<PageReminder[]>;
   write(rows:PageReminder[]):Promise<void>;
@@ -23,7 +23,7 @@ export class ReminderManager {
     const existing=rows.find(row=>!row.deletedAt&&(input.id?row.id===input.id:!row.completedAt&&normalizeUrl(row.url)===key));
     if(input.id&&!existing)throw Error('Reminder not found');
     if(input.repeat)validateRepeat(input.repeat);
-    const reminder:PageReminder={id:existing?.id||crypto.randomUUID(),url:input.url,title:(input.title||url.hostname).slice(0,500),note:(input.note||'').trim().slice(0,2000),at:input.at,repeat:input.repeat,updatedAt:this.now()};
+    const reminder:PageReminder={id:existing?.id||crypto.randomUUID(),url:input.url,title:(input.title||url.hostname).slice(0,500),note:(input.note||'').trim().slice(0,2000),at:input.at,calendarStartAt:input.at,repeat:input.repeat,updatedAt:this.now()};
     await this.browser.write([...rows.filter(row=>row.id!==reminder.id),reminder]);
     await this.browser.alarm(REMINDER_ALARM+reminder.id,reminder.at);
     return reminder;
@@ -31,7 +31,14 @@ export class ReminderManager {
   change(id:string,action:'complete'|'snooze'|'remove',minutes=15):Promise<void>{return this.serial(async()=>{
     if(!['complete','snooze','remove'].includes(action))throw Error('Invalid reminder action');
     const rows=await this.browser.read(),row=rows.find(row=>row.id===id&&!row.deletedAt);if(!row)throw Error('Reminder not found');
-    if(action==='snooze') {if(!Number.isFinite(minutes)||minutes<1||minutes>10080)throw Error('Invalid snooze');row.at=this.now()+minutes*60000;delete row.firedAt;delete row.completedAt;}
+    if(action==='snooze') {
+      if(!Number.isFinite(minutes)||minutes<1||minutes>10080)throw Error('Invalid snooze');
+      row.calendarStartAt ??= row.at;
+      row.at=this.now()+minutes*60000;
+      if(row.repeat)row.snoozedUntil=row.at;
+      delete row.firedAt;
+      delete row.completedAt;
+    }
     if(action==='complete')row.completedAt=this.now();
     if(action==='remove')row.deletedAt=this.now();
     row.updatedAt=this.now();await this.browser.write(rows);await this.browser.clear(REMINDER_ALARM+id);
@@ -52,7 +59,11 @@ export class ReminderManager {
       if(row.at>this.now()) {await this.browser.alarm(REMINDER_ALARM+row.id,row.at).catch(()=>{});continue;}
       try {
         await this.browser.notify(REMINDER_ALARM+row.id,row.title,row.note||'Time to revisit this page.');
-        if(row.repeat) {row.at=nextReminderTime(row.repeat,this.now());await this.browser.alarm(REMINDER_ALARM+row.id,row.at).catch(()=>{});}
+        if(row.repeat) {
+          row.calendarStartAt ??= row.at;
+          row.at=nextReminderTime(row.repeat,this.now());
+          await this.browser.alarm(REMINDER_ALARM+row.id,row.at).catch(()=>{});
+        }
         else row.firedAt=this.now();
         row.updatedAt=this.now();changed=true;
       } catch { /* Keep due records retryable if notifications are unavailable. */ }

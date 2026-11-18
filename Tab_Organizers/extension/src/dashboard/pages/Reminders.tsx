@@ -1,5 +1,6 @@
 import { useEffect, useState, useRef } from 'react';
 import { PageReminder } from '../../lib/reminders';
+import { CalendarConnection } from '../components/CalendarConnection';
 import { getReminders, onRemindersChanged, openReminderEditor, reminderRequest, exportReminder, reminderDescription } from '../../lib/reminder-ui';
 export function Reminders(){
  const [rows,setRows]=useState<PageReminder[]>([]),[error,setError]=useState(''),[busy,setBusy]=useState('');
@@ -10,7 +11,7 @@ export function Reminders(){
  }).catch(err=>setError(err.message));};
  useEffect(()=>{refresh();return onRemindersChanged(refresh);},[]);
  const change=async(row:PageReminder,action:string)=>{setBusy(row.id);try{await reminderRequest('CHANGE_PAGE_REMINDER',{id:row.id,action,minutes:15});refresh();}catch(err){setError((err as Error).message);}finally{setBusy('');}};
- return <section className="reminder-list" aria-label="Reminders"><p>Browser alerts catch up when you return. Repeats continue until you mark them done.</p>
+ return <section className="reminder-list" aria-label="Reminders"><CalendarConnection/><p>Browser alerts catch up when you return. Repeats continue until you mark them done.</p>
  {error&&<p role="alert">{error}</p>}{!rows.length&&<p>No reminders yet. Use the clock above the notes bar on any page.</p>}
  {rows.map(row=><article className={'reminder-card'+(row.completedAt?' completed':'')} key={row.id}>
   <header><input type="checkbox" checked={!!row.completedAt} disabled={!!row.completedAt||busy===row.id} aria-label={'Mark '+row.title+' done'} onChange={()=>void change(row,'complete')}/><strong>{row.title}</strong></header>

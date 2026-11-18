@@ -6,7 +6,7 @@ import uuid
 from zoneinfo import ZoneInfo
 from typing import List, Optional, Dict, Any
 from pydantic import BaseModel, ConfigDict, Field, field_validator
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
@@ -217,7 +217,9 @@ class ScheduledReminder(BaseModel):
     url: str = Field(max_length=6000)
     title: str = Field(max_length=500)
     note: str = Field(default='',max_length=2000)
-    at: float = Field(gt=0,allow_inf_nan=False)
+    at: float = Field(gt=0,lt=253402214400000,allow_inf_nan=False)
+    calendarStartAt: Optional[float] = Field(default=None,gt=0,lt=253402214400000,allow_inf_nan=False)
+    snoozedUntil: Optional[float] = Field(default=None,gt=0,lt=253402214400000,allow_inf_nan=False)
     updatedAt: float = Field(gt=0,allow_inf_nan=False)
     firedAt: Optional[float] = None
     completedAt: Optional[float] = None
@@ -237,7 +239,7 @@ async def scheduled_reminders(db:AsyncSession=Depends(get_db)):
     return [json.loads(row.payload) for row in rows]
 
 @router.put('/scheduled/{reminder_id}')
-async def save_scheduled_reminder(reminder_id:uuid.UUID,payload:ScheduledReminder,db:AsyncSession=Depends(get_db)):
+async def save_scheduled_reminder(reminder_id:uuid.UUID,payload:ScheduledReminder,background_tasks:BackgroundTasks,db:AsyncSession=Depends(get_db)):
     if reminder_id!=payload.id:raise HTTPException(400,'Reminder ID mismatch')
     key='page-reminder:'+str(reminder_id)
     value=payload.model_dump(mode='json',exclude_none=True)
@@ -250,6 +252,9 @@ async def save_scheduled_reminder(reminder_id:uuid.UUID,payload:ScheduledReminde
     if previous.get('updatedAt',0)>payload.updatedAt:return previous
     row.payload=json.dumps(value)
     await db.commit()
+    from app.services.google_calendar import configured, sync_saved_reminder
+    if configured():
+        background_tasks.add_task(sync_saved_reminder, str(reminder_id))
     return value
 
 class InterpretReminder(BaseModel):

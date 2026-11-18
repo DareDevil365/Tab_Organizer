@@ -19,6 +19,8 @@ def validate_cloud_settings():
 
 async def require_owner(request: Request):
     if not settings.cloud or request.method=='OPTIONS' or request.url.path in {'/health','/auth/config'}:return
+    if request.method == 'GET' and request.url.path == '/api/calendar/oauth/callback':
+        return  # Validated by owner-initiated, expiring, single-use OAuth state.
     authorization=request.headers.get('authorization','')
     key=settings.CRON_SECRET if request.url.path=='/api/maintenance' else settings.BACKEND_API_KEY
     if not key or not hmac.compare_digest(authorization.encode(),('Bearer '+key).encode()):
